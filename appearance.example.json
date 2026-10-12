@@ -10,6 +10,12 @@
     "right": 0,
     "bottom": 0
   },
+  "dark_theme": false,
+  "shadow": {
+    "enabled": false,
+    "offset": 10,
+    "border": 3
+  },
   "window": {
     "x": 100,
     "y": 100,
@@ -20,7 +26,8 @@
     "_comment": "Format: <Bank_Name>,<Last_4_Digits>",
     "depository": {
       "title": "Checking & Savings",
-      "order": []
+      "order": [],
+      "new_row_digit_threshold": 6
     },
     "credit": {
       "title": "Credit Cards",

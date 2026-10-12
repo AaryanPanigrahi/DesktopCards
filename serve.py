@@ -3,15 +3,15 @@ Minimal local HTTP server for the dashboard folder. Exists only so
 dashboard.html's fetch('data.json') works without CORS issues. Idle except
 when a request actually comes in -- no polling, no background work.
 
-Also expands theme.json's /theme.json response (accent + scale + spacing +
-layout) on every request. theme.json holds both appearance settings and
-the section layout/ordering (previously a separate layout.json) -- one
-file, one fetch. Its custom_spacing flag picks which spacing source wins:
-false uses extra_spacing (one number, applied to all four sides), true
-uses the per-side spacing object instead. theme.json has no secrets in it
-(unlike config.json, which is never sent to the browser), so editing it
-takes effect on the very next dashboard load with no separate sync script
-to re-run.
+Also expands appearance.json's /appearance.json response (accent + scale +
+spacing + layout) on every request. appearance.json holds both appearance
+settings and the section layout/ordering (previously a separate
+layout.json) -- one file, one fetch. Its custom_spacing flag picks which
+spacing source wins: false uses extra_spacing (one number, applied to all
+four sides), true uses the per-side spacing object instead.
+appearance.json has no secrets in it (unlike config.json, which is never
+sent to the browser), so editing it takes effect on the very next
+dashboard load with no separate sync script to re-run.
 
 POST /refresh calls fetch_data.main() directly in this already-running
 process -- that's what the system tray icon's "Reload" (widget.py) calls.
@@ -37,7 +37,7 @@ import fetch_data
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(DIR, "config.json")
-THEME_PATH = os.path.join(DIR, "theme.json")
+APPEARANCE_PATH = os.path.join(DIR, "appearance.json")
 PORT = json.load(open(CONFIG_PATH)).get("port", 5000)
 
 # Allowlist, not denylist: config.json (Plaid secret + access tokens) and
@@ -45,36 +45,42 @@ PORT = json.load(open(CONFIG_PATH)).get("port", 5000)
 ALLOWED_PATTERNS = ["dashboard*.html", "dashboard.js", "data.json"]
 
 
-def resolve_spacing(theme):
-    if theme.get("custom_spacing"):
-        s = theme.get("spacing", {})
+def resolve_spacing(appearance):
+    if appearance.get("custom_spacing"):
+        s = appearance.get("spacing", {})
         return {
             "left": s.get("left", 0),
             "top": s.get("top", 0),
             "right": s.get("right", 0),
             "bottom": s.get("bottom", 0),
         }
-    v = theme.get("extra_spacing", 0)
+    v = appearance.get("extra_spacing", 0)
     return {"left": v, "top": v, "right": v, "bottom": v}
 
 
-def build_theme():
-    with open(THEME_PATH, "r") as f:
-        theme = json.load(f)
-    # fetch_interval_minutes comes from config.json, not theme.json -- it's
-    # not an appearance setting, but the countdown-to-next-update display
-    # needs it, and this is the one existing channel for handing the
-    # browser a safe, secret-free number out of config.json without ever
-    # serving that file itself.
+def build_appearance():
+    with open(APPEARANCE_PATH, "r") as f:
+        appearance = json.load(f)
+    # fetch_interval_minutes comes from config.json, not appearance.json --
+    # it's not an appearance setting, but the countdown-to-next-update
+    # display needs it, and this is the one existing channel for handing
+    # the browser a safe, secret-free number out of config.json without
+    # ever serving that file itself.
     with open(CONFIG_PATH, "r") as f:
         config = json.load(f)
     return json.dumps({
-        "accent": theme.get("accent"),
-        "scale": theme.get("scale", 1.0),
-        "spacing": resolve_spacing(theme),
-        "corner_radius": theme.get("corner_radius", 0),
+        "accent": appearance.get("accent"),
+        "scale": appearance.get("scale", 1.0),
+        "spacing": resolve_spacing(appearance),
+        "corner_radius": appearance.get("corner_radius", 0),
+        # Passed through as-is; dashboard.js fills in the per-key defaults
+        # so the whole block can be reduced to {"enabled": true}.
+        "shadow": appearance.get("shadow", {}),
+        # One flag, not a palette: the dark colors live in dashboard.html's
+        # [data-theme="dark"] block, so there's nothing per-color to pass.
+        "dark_theme": appearance.get("dark_theme", False),
         "fetch_interval_minutes": config.get("fetch_interval_minutes"),
-        "layout": theme.get("layout", {}),
+        "layout": appearance.get("layout", {}),
     }).encode("utf-8")
 
 
@@ -88,8 +94,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         path_only = self.path.split("?", 1)[0]
 
-        if path_only == "/theme.json":
-            body = build_theme()
+        if path_only == "/appearance.json":
+            body = build_appearance()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

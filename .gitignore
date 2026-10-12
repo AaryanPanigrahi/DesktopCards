@@ -1,8 +1,11 @@
 config.json
-theme.json
+appearance.json
 data.json
 cache/
 __pycache__/
 *.pyc
 .venv/
 venv/
+.claude/
+newUI/
+potential_changes.txt

@@ -7,9 +7,9 @@ const POLL_MS = 5 * 60 * 1000; // re-read data.json every 5 min; no network call
 // lives in the system tray icon (widget.py), which calls POST /refresh
 // and then tells this page to reload.
 
-function fmtMoney(n) {
+function fmtMoney(n, decimals = 1) {
   if (n === null || n === undefined) return '–';
-  return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+  return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
 function fmtDate(iso) {
@@ -19,7 +19,122 @@ function fmtDate(iso) {
 }
 
 function fmtMask(mask) {
-  return mask ? `&bull;${mask}` : '';
+  return mask ? `&bull;&bull;${mask}` : '';
+}
+
+// One warning palette for both card types: a credit card at 27-35%
+// utilization and a debit card running low read as the same degree of
+// "watch this", so they share a yellow rather than being two near-misses.
+// Kept as [h, s, l] components so the ramp below can interpolate between
+// them -- hardcoding its endpoints separately meant a change to the
+// yellow left a visible step at the 35% boundary.
+//
+// Two yellows, same hue, different intensity: small 13px text needs the
+// muted one to stay easy on the eye, while the bar is a solid block of
+// color where that same muting just reads as dull, so it keeps the fully
+// saturated original.
+// Two sets of the same four colors, because these are the one part of the
+// palette CSS variables can't carry: they're computed per-card in JS and
+// written as inline styles. Same hues in both, only lifted in lightness
+// and eased off in saturation for the dark theme -- a 38%-lightness deep
+// red that reads as urgent against white is nearly invisible on a dark
+// card, and a fully saturated yellow on dark glows. Keeping the hues
+// identical is what makes the two themes feel like the same widget.
+const WARN_PALETTES = {
+  light: {
+    grey:       'hsl(220, 9%, 46%)',
+    yellow:     [45, 55, 50],
+    barYellow:  [45, 90, 48],
+    red:        [0, 80, 38],
+  },
+  dark: {
+    grey:       'hsl(220, 9%, 62%)',
+    yellow:     [45, 68, 60],
+    barYellow:  [45, 85, 55],
+    red:        [0, 72, 54],
+  },
+};
+
+// Swapped wholesale by applyTheme; every reader goes through warn() so a
+// theme change needs no second place to remember.
+let currentWarn = WARN_PALETTES.light;
+const warn = () => currentWarn;
+
+const hsl = ([h, s, l]) => `hsl(${h}, ${s}%, ${l}%)`;
+
+// How hard the yellow->red ramp front-loads its move toward red. Below 1
+// the hue leaves yellow fast and spends most of the range in the urgent
+// end, so the middle of the bar looks like a problem instead of a tame
+// amber; a straight linear ramp was still orange-ish at 85%.
+const URGENCY_EXP = 0.5;
+
+// Grey below 27%, flat yellow 27-35%, then a yellow->deep-red ramp as it
+// climbs from 35% toward (and past) 100% -- utilization can exceed 100%,
+// but the color maxes out at the deep red there rather than going further,
+// since there's nowhere redder to telegraph. The percent text and the
+// bar run the same ramp off their own yellow, so they always agree on
+// how bad things are even though they disagree on intensity.
+function utilRamp(pct, yellow) {
+  if (pct < 27) return warn().grey;
+  if (pct < 35) return hsl(yellow);
+  const t = Math.min(1, (pct - 35) / (100 - 35)) ** URGENCY_EXP;
+  const red = warn().red;
+  return hsl(yellow.map((from, i) => from + (red[i] - from) * t));
+}
+
+const utilColor = pct => utilRamp(pct, warn().yellow);
+const barColor = pct => utilRamp(pct, warn().barYellow);
+
+// Section boundaries on the usage bar, now matching utilColor's own
+// thresholds (27/35) instead of the doc's 33, so a ridge lands exactly
+// where the color changes.
+const UTIL_BINS = [27, 35, 66];
+
+// Only the ridges you've already crossed, plus the one immediately ahead:
+// at 10% you see 27; at 30% you see 27 and 35. Showing all of them at
+// once turned the bar into a ruler, where the point is to mark the line
+// you're about to cross.
+function visibleRidges(pct) {
+  const next = UTIL_BINS.find(b => b > pct);
+  const shown = UTIL_BINS.filter(b => b <= pct);
+  if (next !== undefined) shown.push(next);
+  return shown;
+}
+
+// The bar is cut into separately-rounded sections at the visible ridges
+// only, so the sections appear as you reach them -- the stretch beyond
+// the upcoming ridge stays one unbroken block rather than being
+// pre-divided by boundaries you haven't earned yet.
+function utilBar(rawPct) {
+  const pct = Math.max(0, rawPct ?? 0);
+  const color = barColor(pct);
+  const edges = [0, ...visibleRidges(pct), 100];
+  let segs = '';
+  for (let i = 0; i < edges.length - 1; i++) {
+    const start = edges[i];
+    const span = edges[i + 1] - start;
+    // Sections grow in proportion to the range they cover, from a zero
+    // basis, so the gaps between them come out of the sections rather
+    // than skewing their relative widths.
+    const filled = Math.max(0, Math.min(1, (pct - start) / span)) * 100;
+    const fill = filled > 0
+      ? `<div class="fill" style="width:${filled.toFixed(1)}%;background-color:${color}"></div>`
+      : '';
+    segs += `<div class="range-seg" style="flex-grow:${span}">${fill}</div>`;
+  }
+  return `<div class="range">${segs}</div>`;
+}
+
+// A debit balance that's nearly spent, or overdrawn past a small buffer.
+// Anything healthier keeps the card's normal text color.
+const LOW_BALANCE = 10;
+const OVERDRAWN_BALANCE = -25;
+
+function balanceColor(balance) {
+  if (balance === null || balance === undefined) return null;
+  if (balance < OVERDRAWN_BALANCE) return hsl(warn().red);
+  if (balance <= LOW_BALANCE) return hsl(warn().yellow);
+  return null;
 }
 
 // Logo + issuing bank name, shared by both card types. Falls back to a
@@ -44,24 +159,127 @@ function cardHead(acc, dueText) {
   `;
 }
 
-function renderDepository(acc) {
+// Cards are sized for amounts up to 9999.9; every digit past that needs
+// room the default layout doesn't have. The per-digit cost is roughly one
+// digit's width at that element's own font size (plus slack for the extra
+// thousands separator a longer number picks up), which is why these
+// differ: a credit card's balance is set much larger than the credit line
+// printed beside it, and larger again than a two-up debit balance.
+const FITS_DIGITS = 4;
+const DEBIT_PX_PER_DIGIT = 16;
+const CREDIT_BALANCE_PX_PER_DIGIT = 20;
+const CREDIT_LIMIT_PX_PER_DIGIT = 8;
+const DEFAULT_NEW_ROW_DIGITS = 6;
+
+function intDigits(n) {
+  return Math.floor(Math.abs(n ?? 0)).toString().length;
+}
+
+function digitsOver(n) {
+  return Math.max(0, intDigits(n) - FITS_DIGITS);
+}
+
+// Extra width this balance needs past the default two-up box, in px.
+function debitExtraPx(acc) {
+  return digitsOver(acc.balance) * DEBIT_PX_PER_DIGIT;
+}
+
+// Credit cards span the full width, so they have no box of their own to
+// widen -- their overflow goes straight to the window, which they then
+// fill. Balance and credit line are measured separately since they're set
+// at different sizes.
+function creditExtraPx(acc) {
+  return digitsOver(acc.balance) * CREDIT_BALANCE_PX_PER_DIGIT
+    + (acc.limit ? digitsOver(acc.limit) * CREDIT_LIMIT_PX_PER_DIGIT : 0);
+}
+
+// Same idea as a long word in a line of text: one that's only slightly too
+// long stays put and takes the slack, one that's far too long drops onto a
+// line of its own. Pairing resumes after it, so a card that breaks out
+// doesn't reshuffle the cards around it.
+function layoutDebitRows(accounts, newRowDigits) {
+  const rows = [];
+  let pending = null;
+  const flushPending = () => {
+    if (pending) rows.push({ cards: [pending], full: false });
+    pending = null;
+  };
+  for (const acc of accounts) {
+    if (intDigits(acc.balance) >= newRowDigits) {
+      flushPending();
+      rows.push({ cards: [acc], full: true });
+    } else if (pending) {
+      rows.push({ cards: [pending, acc], full: false });
+      pending = null;
+    } else {
+      pending = acc;
+    }
+  }
+  flushPending();
+  return rows;
+}
+
+// Must track dashboard.html's --card-gap and #cards' horizontal padding.
+const CARD_GAP = 8;
+const CARDS_SIDE_PADDING = 24;
+
+// One debit box's share of a row nothing has overflowed. Must track
+// --debit-base in dashboard.html, including its shadow-border term: these
+// widths are written inline (renderDepository), so they, not the CSS, are
+// what actually sizes a debit box -- leaving the border out here would end
+// the row short of the credit card above it by exactly that much.
+function debitBaseWidth() {
+  return (BASE_WIDTH - CARDS_SIDE_PADDING + shadowBorder * 2 - CARD_GAP) / 2;
+}
+
+// Final width for every box in one row: what it needs on its own, plus a
+// slice of whatever the credit cards widened the window by. The slice is
+// proportional to how much of the row that box already occupies, so a box
+// that's wider to begin with takes more of the slack and a narrower one
+// takes less -- the row still ends flush with the credit card above it,
+// without the boxes inside it all being forced to the same size.
+function distributeRowWidths(cards, creditExtra) {
+  const needs = cards.map(acc => debitBaseWidth() + debitExtraPx(acc));
+  const total = needs.reduce((sum, n) => sum + n, 0);
+  return needs.map(n => n + creditExtra * (n / total));
+}
+
+function renderDepository(acc, width) {
+  const initial = (acc.institution_name || '?').charAt(0).toUpperCase();
+  const logo = acc.logo
+    ? `<img class="card-logo debit-logo" src="${acc.logo}" alt="">`
+    : `<span class="card-logo-fallback debit-logo">${initial}</span>`;
+  const grow = width ? ` style="flex:0 0 ${width.toFixed(2)}px"` : '';
+  const warn = balanceColor(acc.balance);
+  const warnStyle = warn ? ` style="color:${warn}"` : '';
   return `
-    <div class="card">
-      ${cardHead(acc)}
-      <div class="card-mask-line">${fmtMask(acc.mask)}</div>
-      <div class="balance">${fmtMoney(acc.balance)}</div>
+    <div class="card"${grow}>
+      <div class="card-head debit-head">
+        ${logo}
+        <div class="debit-info">
+          <span class="bank-name">${acc.institution_name}</span>
+          <span class="card-mask-line">${fmtMask(acc.mask)}</span>
+        </div>
+      </div>
+      <div class="balance"${warnStyle}>${fmtMoney(acc.balance)}</div>
     </div>
   `;
 }
 
 function renderCredit(acc) {
   const due = fmtDate(acc.next_payment_due_date);
-  const pct = Math.max(0, Math.min(100, acc.percent_used ?? 0));
+  const rawPct = acc.limit ? Math.round((acc.balance / acc.limit) * 1000) / 10 : null;
+  const util = rawPct !== null
+    ? `<span class="util-pct" style="color:${utilColor(Math.max(0, rawPct))}">${rawPct}%</span>`
+    : '';
   return `
-    <div class="card">
+    <div class="card credit-card">
       ${cardHead(acc, due)}
-      <div class="balance">${fmtMoney(acc.balance)}${acc.limit ? ' <span class="of-limit">/ ' + fmtMoney(acc.limit) + '</span>' : ''}</div>
-      <div class="range"><div class="fill" style="width:${pct}%"></div></div>
+      <div class="balance-row">
+        <div class="balance">${fmtMoney(acc.balance)}${acc.limit ? ' <span class="of-limit">/ ' + fmtMoney(acc.limit, 0) + '</span>' : ''}</div>
+        ${util}
+      </div>
+      ${utilBar(rawPct)}
     </div>
   `;
 }
@@ -77,7 +295,7 @@ function renderError(err) {
   `;
 }
 
-// Default fallback if theme.json's layout is missing or fails to load.
+// Default fallback if appearance.json's layout is missing or fails to load.
 // Keyed by account type -- that's the one thing a section can't just be
 // "title and order" about, since it's what decides which accounts land in
 // it at all. Keeping it as the object key (not a separate "type"/"id"
@@ -89,7 +307,7 @@ const DEFAULT_LAYOUT = {
 };
 const SECTION_TYPES = Object.keys(DEFAULT_LAYOUT);
 
-// theme.json identifies accounts by "Bank Name,last4" instead of Plaid's
+// appearance.json identifies accounts by "Bank Name,last4" instead of Plaid's
 // opaque account_id, since someone hand-editing the ordering has no way to
 // know which account_id is which card. Plain comma, not a middle dot --
 // easier to type by hand.
@@ -105,21 +323,82 @@ function applyOrder(accounts, orderKeys) {
   return [...known, ...unknown];
 }
 
-// theme.json (accent, scale, extra_spacing, layout, ...) is a standalone
+// appearance.json (accent, scale, extra_spacing, layout, ...) is a standalone
 // file -- separate from config.json's Plaid credentials -- so it's safe
 // for serve.py to expand and send straight to the browser. Layout used to
 // be its own layout.json/fetch; it's just one more thing in this same
 // response now, one file instead of two. Edits take effect on the next
 // load with no sync script to re-run. Falls back to the page's own
-// stylesheet defaults (and DEFAULT_LAYOUT) if theme.json is missing.
+// stylesheet defaults (and DEFAULT_LAYOUT) if appearance.json is missing.
 let fetchIntervalMinutes = null;
 let currentLayout = DEFAULT_LAYOUT;
 
-async function applyTheme() {
+// The hard offset shadow from newUI/short_css.txt, off unless
+// appearance.json asks for it. Defaults match that reference exactly
+// (10px offset, 3px border, #323232) so "enabled": true alone gives the
+// look it was taken from, with each piece still overridable.
+// No default color here on purpose: the stylesheet owns that, because it's
+// the one piece of the shadow that has to differ per theme (#323232 on
+// light, near-black on dark -- see :root[data-theme="dark"] in
+// dashboard.html). An inline style written here would beat the theme block
+// and pin the light value in both themes.
+const SHADOW_DEFAULTS = { offset: 10, border: 3 };
+
+// How much wider the shadow makes the window. fitWindowToContent computes
+// the window width from BASE_WIDTH rather than measuring the page, so this
+// has to be kept in step with --shadow-grow in dashboard.html by hand --
+// growing one without the other either clips the shadow off the right
+// edge of the window or leaves a strip of bare desktop-colored window
+// beside the cards.
+let shadowGrow = 0;
+
+// The border alone, which debitBaseWidth needs separately: of the two
+// things the window grows by, the offset is whitespace the shadow paints
+// into and the border is width the cards themselves get back.
+let shadowBorder = 0;
+
+function applyShadow(shadow) {
+  const on = !!(shadow && shadow.enabled);
+  const { offset, border, color } = { ...SHADOW_DEFAULTS, ...(shadow || {}) };
+  // Off means zero *lengths*, not an unset color: a 0 0 hard shadow hides
+  // exactly behind the opaque card and a 0px border draws nothing, so one
+  // .card ruleset covers both states (see dashboard.html).
+  const px = on ? { offset, border } : { offset: 0, border: 0 };
+  // Exposed to CSS as well as applied: the dark theme wants a slightly
+  // darker card when there's no border framing it (see dashboard.html).
+  document.documentElement.dataset.shadow = on ? 'on' : 'off';
+  const root = document.documentElement.style;
+  root.setProperty('--shadow-offset', `${px.offset}px`);
+  root.setProperty('--shadow-border', `${px.border}px`);
+  // Only when asked for explicitly -- otherwise leave the variable unset so
+  // the per-theme stylesheet default applies (see SHADOW_DEFAULTS).
+  if (color) root.setProperty('--shadow-color', color);
+  else root.removeProperty('--shadow-color');
+  shadowGrow = px.offset + px.border * 2;
+  shadowBorder = px.border;
+}
+
+// The whole light/dark swap is one attribute on <html>: every color the
+// stylesheet paints comes from a --surface-*/--text-* variable, and
+// [data-theme="dark"] in dashboard.html redefines exactly those (see
+// README "Dark theme"). The JS-computed warning colors are the only ones
+// that can't ride along on a CSS variable, so they swap here too.
+// --accent is deliberately left alone: it's your live Windows accent
+// color, and recoloring it would be second-guessing a choice you already
+// made in Windows itself.
+function applyTheme(dark) {
+  const on = !!dark;
+  document.documentElement.dataset.theme = on ? 'dark' : 'light';
+  currentWarn = on ? WARN_PALETTES.dark : WARN_PALETTES.light;
+}
+
+async function applyAppearance() {
   try {
-    const res = await fetch('theme.json', { cache: 'no-store' });
+    const res = await fetch('appearance.json', { cache: 'no-store' });
     if (!res.ok) return;
-    const { accent, scale, spacing, corner_radius, fetch_interval_minutes, layout } = await res.json();
+    const { accent, scale, spacing, corner_radius, shadow, dark_theme, fetch_interval_minutes, layout } = await res.json();
+    applyShadow(shadow);
+    applyTheme(dark_theme);
     if (accent) document.documentElement.style.setProperty('--accent', accent);
     if (scale) {
       document.documentElement.style.setProperty('--scale', scale);
@@ -135,7 +414,7 @@ async function applyTheme() {
       shell.style.margin = `${spacing.top}px ${spacing.right}px ${spacing.bottom}px ${spacing.left}px`;
     }
   } catch (e) {
-    // no theme.json yet -- stylesheet default stands
+    // no appearance.json yet -- stylesheet default stands
   }
 }
 
@@ -169,12 +448,12 @@ function formatCountdown(mins) {
 }
 
 // Exposed for widget.py's tray "Reload" to call via evaluate_js -- load()
-// alone only re-reads data.json (balances), never theme.json, which is why
+// alone only re-reads data.json (balances), never appearance.json, which is why
 // a manual reload picked up fresh balances but not accent/scale/spacing
 // changes. corner_radius is handled separately, window-side, in widget.py
 // itself (it clips the native window, not something this page can do).
 async function reloadAll() {
-  await applyTheme();
+  await applyAppearance();
   await load();
 }
 
@@ -209,6 +488,21 @@ async function load() {
     let html = '';
     let updatedPlaced = false;
 
+    // Both overflows are measured before anything renders, because a debit
+    // row's widths depend on what the credit cards did to the window, and
+    // the credit section renders after the debit one.
+    const depositoryDef = layout.depository || DEFAULT_LAYOUT.depository;
+    const newRowDigits = depositoryDef.new_row_digit_threshold || DEFAULT_NEW_ROW_DIGITS;
+    const widest = (list, measure) => list.reduce((max, a) => Math.max(max, measure(a)), 0);
+    const creditExtra = widest(accounts.filter(a => a.type === 'credit'), creditExtraPx);
+    // Cards that break onto a row of their own are left out: they span the
+    // whole row already, so they never widen a box.
+    const debitExtra = widest(
+      accounts.filter(a => a.type === 'depository' && intDigits(a.balance) < newRowDigits),
+      debitExtraPx,
+    );
+    const extraWidth = creditExtra + debitExtra;
+
     for (const type of SECTION_TYPES) {
       const sectionDef = layout[type] || DEFAULT_LAYOUT[type];
       const inSection = accounts.filter(a => a.type === type);
@@ -226,7 +520,16 @@ async function load() {
       // half of the window on whitespace.
       if (type === 'depository') {
         html += '<div class="card-grid">';
-        for (const acc of ordered) html += renderDepository(acc);
+        for (const row of layoutDebitRows(ordered, newRowDigits)) {
+          html += `<div class="debit-row${row.full ? ' debit-row-full' : ''}">`;
+          // A full-row card spans the row on its own (CSS), so it needs no
+          // width of its own here.
+          const widths = row.full ? [] : distributeRowWidths(row.cards, creditExtra);
+          row.cards.forEach((acc, i) => {
+            html += renderDepository(acc, widths[i]);
+          });
+          html += '</div>';
+        }
         html += '</div>';
       } else {
         for (const acc of ordered) {
@@ -250,6 +553,8 @@ async function load() {
     }
 
     cardsEl.innerHTML = html;
+    document.documentElement.style.setProperty('--extra-width', `${extraWidth}px`);
+    currentExtraWidth = extraWidth;
     fitWindowToContent();
   } catch (e) {
     document.getElementById('cards').innerHTML =
@@ -263,9 +568,11 @@ async function load() {
 const MAX_WINDOW_HEIGHT = 700;
 
 // Must match #cards' own width in dashboard.html -- the design-width
-// anchor that --scale (zoom) is applied against.
-const BASE_WIDTH = 400;
+// anchor that --scale (zoom) is applied against. currentExtraWidth is
+// whatever an oversized debit balance added to it on the last render.
+const BASE_WIDTH = 325;
 let currentScale = 1;
+let currentExtraWidth = 0;
 
 function fitWindowToContent() {
   requestAnimationFrame(() => {
@@ -275,7 +582,7 @@ function fitWindowToContent() {
     // same kind of floor that documentElement.scrollHeight has for height
     // (which is why that one reads body instead -- but body's width
     // apparently hits an analogous floor that body's height doesn't).
-    const contentWidth = Math.round(BASE_WIDTH * currentScale);
+    const contentWidth = Math.round((BASE_WIDTH + currentExtraWidth + shadowGrow) * currentScale);
     const contentHeight = document.body.scrollHeight;
 
     if (window.pywebview) {
@@ -315,7 +622,7 @@ function waitForPywebviewReady() {
 // initial window size is computed against the un-scaled layout.
 async function init() {
   await waitForPywebviewReady();
-  await applyTheme();
+  await applyAppearance();
   await load();
   setInterval(load, POLL_MS);
 }

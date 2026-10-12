@@ -1,8 +1,8 @@
 """
 Reads the current Windows accent color from the registry and records it in
-theme.json. serve.py reads theme.json live on every request, so the
-dashboard picks up the new color on its next load -- no separate sync step
-needed. Re-run this any time you change your Windows accent color
+appearance.json. serve.py reads appearance.json live on every request, so
+the dashboard picks up the new color on its next load -- no separate sync
+step needed. Re-run this any time you change your Windows accent color
 (Settings > Personalization > Colors).
 """
 
@@ -11,7 +11,7 @@ import os
 import sys
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-THEME_PATH = os.path.join(PROJECT_DIR, "theme.json")
+APPEARANCE_PATH = os.path.join(PROJECT_DIR, "appearance.json")
 
 
 def read_accent():
@@ -32,18 +32,18 @@ def main():
 
     accent = read_accent()
 
-    theme = {}
-    if os.path.exists(THEME_PATH):
-        with open(THEME_PATH, "r") as f:
-            theme = json.load(f)
-    theme["accent"] = accent
-    theme.setdefault("scale", 1.0)
-    theme.setdefault("extra_spacing", 0)
+    appearance = {}
+    if os.path.exists(APPEARANCE_PATH):
+        with open(APPEARANCE_PATH, "r") as f:
+            appearance = json.load(f)
+    appearance["accent"] = accent
+    appearance.setdefault("scale", 1.0)
+    appearance.setdefault("extra_spacing", 0)
 
-    with open(THEME_PATH, "w") as f:
-        json.dump(theme, f, indent=2)
+    with open(APPEARANCE_PATH, "w") as f:
+        json.dump(appearance, f, indent=2)
 
-    print(f"Accent color {accent} -- saved to theme.json")
+    print(f"Accent color {accent} -- saved to appearance.json")
 
 
 if __name__ == "__main__":

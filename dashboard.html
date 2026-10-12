@@ -1,5 +1,8 @@
 <!doctype html>
-<html lang="en">
+<!-- data-shadow starts at "off" to match the 0 lengths the stylesheet
+     defaults to, so the markup and the CSS agree before dashboard.js has
+     read appearance.json (or if it can't). data-theme is set there too. -->
+<html lang="en" data-shadow="off">
 <head>
 <meta charset="utf-8">
 <title>Balances</title>
@@ -15,10 +18,108 @@
     --text-muted:     #6b7280;
     --text-faint:     #9ca3af;
     --ring-track:      #e5e7eb;
-    --accent:          #c9b7e8; /* overridden at runtime from theme.json (Windows accent color); also stands in for the hardcoded green/red in the Uiverse source cards */
+    --error-surface:   #fef2f2;
+    --accent:          #c9b7e8; /* overridden at runtime from appearance.json (Windows accent color); also stands in for the hardcoded green/red in the Uiverse source cards */
     --error:           #ef4444;
-    --scale:           1; /* overridden at runtime from theme.json */
-    --corner-radius:   20px; /* overridden at runtime from theme.json */
+    --scale:           1; /* overridden at runtime from appearance.json */
+    --corner-radius:   20px; /* overridden at runtime from appearance.json */
+
+    /* Design widths. --content-width is the room cards actually get (a
+       credit card, or two debit cards plus the gap between them); #cards
+       adds its own horizontal padding back on top. --extra-width is set
+       at runtime by dashboard.js when an oversized amount needs more room
+       than the default layout has, and is the total the window grows by.
+       --debit-base is a
+       debit box's share of an untouched row, used as-is when nothing
+       overflows; when something does, dashboard.js computes each box's
+       width itself (see distributeRowWidths) rather than expressing it
+       here, because the share each box gets depends on the other boxes
+       in its row. */
+    --content-width:   301px;
+    --card-gap:        8px;
+    --extra-width:     0px;
+    /* + the border twice for the same reason #cards' width takes it: each
+       box gives that much back to its own inner width, so a shadowed row
+       still ends flush with the credit card above it instead of leaving a
+       strip of page showing at its right end. */
+    --debit-base:      calc((var(--content-width) + var(--shadow-border) * 2 - var(--card-gap)) / 2);
+
+    /* Neo-brutalist hard shadow + matching border, from
+       newUI/short_css.txt (appearance.json "shadow"). Both lengths default
+       to 0 so the effect is simply absent unless it's switched on -- a
+       0 0 hard shadow paints exactly behind the opaque card where nothing
+       can see it, and a 0px border draws nothing -- which keeps this to
+       one ruleset on .card instead of a second shadowed variant of it.
+       --shadow-grow is the horizontal room the pair of them needs beyond
+       the card's own box: the offset, plus the border twice, since the
+       global box-sizing: border-box otherwise takes the border out of the
+       card's *inner* width and squeezes the balance text. dashboard.js
+       adds the same number to the window width it asks widget.py for --
+       that width is computed, never measured, so growing it here alone
+       would only have gotten the shadow clipped off. */
+    --shadow-offset:   0px;
+    --shadow-border:   0px;
+    --shadow-color:    #323232;
+    --shadow-grow:     calc(var(--shadow-offset) + var(--shadow-border) * 2);
+  }
+
+  /* Dark theme (appearance.json "dark_theme": true -- dashboard.js sets
+     this attribute on <html>). Nothing here is a new rule: every color in
+     the stylesheet below already comes from one of these variables, so the
+     whole theme is this one block of redefinitions and nothing downstream
+     needs a dark variant.
+
+     Not black. The cards stay a step lighter than the page behind them,
+     exactly as white-on-grey does in the light theme, because that step is
+     what makes them read as cards rather than as regions of one dark
+     sheet -- and a pure #000 page would make the rounded corners and the
+     card edges vanish into the desktop wallpaper instead of floating on
+     it. The hue is a cool blue-grey (not neutral) to match the light
+     theme's slate text, so switching themes doesn't also change the
+     widget's temperature.
+
+     Text runs four steps dimmer rather than four steps of grey: on dark
+     surfaces, lowering opacity-like lightness is what reads as hierarchy,
+     where on white it's darkening. --text-primary stops short of #fff so
+     the big balance numbers don't bloom against the dark card.
+
+     color-scheme is set too, so the native scrollbar in #cards and any
+     form UI WebView2 draws come out dark instead of a light strip. */
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0:      #1d2128;
+    --surface-1:      #292e37;
+    --surface-2:      #3e4651;
+    --text-primary:   #f2f4f7;
+    --text-secondary: #d5dbe3;
+    --text-muted:     #a2abb8;
+    --text-faint:     #7a8391;
+    --ring-track:     #3e4651;
+    --error:          #fa8585;
+    --error-surface:  #43282d;
+    /* Dark, which only works because the surfaces above are mid-greys
+       rather than near-black: this shadow has no blur, so it's a drawn
+       edge and needs contrast to exist at all, and against a #1d2128 page
+       a near-black slab has plenty. (It did not against the darker
+       surfaces this theme started with, which is why a light inverted
+       shadow was the right answer then and the wrong one now.) Darker
+       than the page rather than equal to it, so the slab stays visible
+       where it falls outside the card. appearance.json's shadow.color
+       still overrides this. */
+    --shadow-color:   #101318;
+  }
+
+  /* Shadow off, dark theme: a slightly darker card. With the shadow on,
+     the dark border wraps each card in a thin frame that visually holds
+     its surface down; take the frame away and the same grey reads as a
+     brighter slab, bright enough to glare at a glance. So the card loses
+     a step of lightness to compensate, and the two states end up looking
+     equally bright even though they aren't the same color. The page
+     behind it is left alone -- it's the card face that gets brighter, not
+     the whole widget. Only the dark theme needs this: on white, a card
+     without a border reads as paper, which is the point. */
+  :root[data-theme="dark"][data-shadow="off"] {
+    --surface-1: #23272f;
   }
 
   * { box-sizing: border-box; }
@@ -58,23 +159,40 @@
      Putting width:400px directly on #shell left #shell always exactly
      400px wide regardless of scale (an explicit length on the zoomed
      element isn't itself rescaled), which is the whitespace/clipping bug
-     this replaces. extra_spacing (theme.json) sets #shell's margin at
+     this replaces. extra_spacing (appearance.json) sets #shell's margin at
      runtime -- margin (not padding) so negative values can pull content
      in past the card edges; overflow:hidden on html/body above prevents
      it from collapsing with body's own box. */
   #shell { margin: 0; zoom: var(--scale); }
 
   #cards {
-    width: 400px;
+    /* Shrunk from 400px to match the 20% credit-card truncation below --
+       cards now fill 100% of this (already-truncated) width instead of
+       leaving dead space in a full-size window. Grows by --extra-width
+       when an oversized debit balance needs more room. */
+    width: calc(var(--content-width) + 24px + var(--extra-width) + var(--shadow-grow));
     max-height: 700px;
-    overflow-y: auto; padding: 10px 12px 10px;
-    display: flex; flex-direction: column; gap: 10px;
+    /* The shadow is cast down and to the right only, so only those two
+       sides need extra room -- and only as much as the shadow actually
+       occupies, which is the offset. The other half of --shadow-grow (the
+       border, twice) is room for the cards themselves: border-box takes
+       the border out of their *inner* width, so the window grows by it to
+       give that width back rather than squeezing the balance text. Adding
+       it to the padding here instead was the bug that left a wider margin
+       on the right than the left -- padding is the one thing that decides
+       how much whitespace sits beside the shadow, and 12px on both sides
+       is what makes it even. The column gap grows by the offset too, or
+       the next card down would be painted over the shadow of the one
+       above it. */
+    overflow-y: auto;
+    padding: 10px calc(12px + var(--shadow-offset)) calc(10px + var(--shadow-offset)) 12px;
+    display: flex; flex-direction: column; gap: calc(10px + var(--shadow-offset));
   }
 
   #cards::-webkit-scrollbar { width: 6px; }
   #cards::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 3px; }
 
-  .section { display: flex; flex-direction: column; gap: 6px; }
+  .section { display: flex; flex-direction: column; gap: calc(6px + var(--shadow-offset)); }
 
   .section-title {
     display: flex; justify-content: space-between; align-items: baseline;
@@ -100,6 +218,9 @@
     background: var(--surface-1);
     border-radius: 20px;
     padding: 1rem;
+    /* Inert at the 0 defaults -- see --shadow-offset above. */
+    border: var(--shadow-border) solid var(--shadow-color);
+    box-shadow: var(--shadow-offset) var(--shadow-offset) var(--shadow-color);
   }
 
   .card-head {
@@ -108,18 +229,35 @@
 
   /* Two per row for Checking & Savings -- these cards are short enough
      (logo/name/balance, no bar or due date) that a single column wastes
-     the right half of the window. aspect-ratio keeps them closer to a
-     square (leaning landscape, ~4:3) instead of a thin thumbnail-shaped
-     strip; justify-content centers the two lines of content inside that
-     taller shape instead of leaving them stuck to the top. */
-  .card-grid {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
-  }
+     the right half of the window. No forced aspect-ratio -- that was
+     padding the box out past its actual content height; sizing to content
+     (same padding as the credit cards) keeps top/bottom whitespace equal
+     to theirs instead of artificially taller.
+
+     Rows are independent flex containers rather than one shared grid:
+     grid column tracks are shared by every row, so a grid couldn't let
+     one row's card be wider than another row's without dragging all of
+     them along. Each card is pinned to --debit-base (not a 1fr share of
+     the row), so when the window grows for an oversized balance, only the
+     card that actually needs the room takes it -- its row partner keeps
+     the width it already had. */
+  /* .card-grid's gap is the vertical one between debit rows, so it can
+     take the shadow offset freely. .debit-row's is horizontal and feeds
+     distributeRowWidths' px math via CARD_GAP in dashboard.js, so it's
+     left alone: the right-hand card simply paints over the part of its
+     neighbour's shadow that doesn't fit in 8px, which reads as the shadow
+     tucking under it rather than as a defect. */
+  .card-grid { display: flex; flex-direction: column; gap: calc(var(--card-gap) + var(--shadow-offset)); }
+  .debit-row { display: flex; gap: var(--card-gap); }
   .card-grid .card {
-    padding: 0.85rem; aspect-ratio: 4 / 3;
+    flex: 0 0 var(--debit-base);
+    padding: 1rem;
     display: flex; flex-direction: column; justify-content: center;
   }
-  .card-grid .balance { margin: 0.6rem 0 0; font-size: 1.6rem; line-height: 1.8rem; }
+  /* A balance too long for even a widened box gets its own row, and
+     matches the credit cards' width so it doesn't look out of place. */
+  .debit-row-full .card { flex: 1 1 auto; }
+  .card-grid .balance { margin: 0.6rem 0 0; font-size: 1.75rem; line-height: 1.95rem; }
 
   .card-logo {
     width: 1.5rem; height: 1.5rem; border-radius: 9999px; flex-shrink: 0;
@@ -131,6 +269,29 @@
     background: var(--accent); color: #fff;
     display: flex; align-items: center; justify-content: center;
     font-size: 11px; font-weight: 700;
+  }
+
+  /* Debit/savings header: logo + [bank name, "Debit ••1234"] grouped and
+     vertically centered against the logo, instead of the bank name
+     sitting on its own row with the mask line indented below the whole
+     header. Declared after .card-logo/.card-logo-fallback so this size
+     wins despite equal selector specificity. */
+  .debit-head { align-items: center; }
+
+  .debit-logo {
+    width: 1.6rem; height: 1.6rem; font-size: 10px;
+  }
+
+  .debit-info {
+    margin-left: 0.45rem; min-width: 0;
+    display: flex; flex-direction: column; justify-content: center; gap: 1px;
+  }
+
+  .debit-info .bank-name { margin-left: 0; font-size: 13px; }
+
+  .card-mask-line {
+    color: var(--accent); font-weight: 600;
+    font-size: 11px; font-variant-numeric: tabular-nums;
   }
 
   .bank-name {
@@ -148,31 +309,51 @@
     flex-shrink: 0; font-variant-numeric: tabular-nums;
   }
 
-  /* Debit cards only -- last-4 drops to its own line under the header
-     instead of widening that row, so the header can stay narrow/truncate
-     sooner. Indented to line up under the bank name, past the logo. */
-  .card-mask-line {
-    margin: 2px 0 0 2rem; color: var(--accent); font-weight: 600;
-    font-size: 11px; font-variant-numeric: tabular-nums;
-  }
-
   .due-inline {
     margin-left: auto; flex-shrink: 0;
     font-size: 12px; color: var(--text-muted); font-weight: 500;
     white-space: nowrap;
   }
 
+  .balance-row {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin: 0.85rem 0 0.3rem;
+  }
+
+  /* Less bottom padding than the shared .card default -- the usage bar
+     sat with dead space below it before this, now that it's pulled up
+     closer to the balance via .balance-row's smaller bottom margin. */
+  .credit-card { padding-bottom: 0.75rem; }
+
   .balance {
-    margin: 0.85rem 0; color: var(--text-primary);
+    color: var(--text-primary);
     font-size: 2.25rem; line-height: 2.5rem; font-weight: 700;
     font-variant-numeric: tabular-nums; text-align: left;
   }
 
   .of-limit { color: var(--text-muted); font-size: 15px; font-weight: 400; }
 
+  .util-pct {
+    font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums;
+    flex-shrink: 0; margin-left: 0.5rem;
+  }
+
+  /* Split into separately-rounded utilization sections rather than being
+     one continuous track: the track color moved onto the sections
+     themselves, so the gaps between them read as card-colored dividers
+     and each section keeps rounded ends of its own. Which boundaries get
+     a split is decided per-render -- see visibleRidges in dashboard.js. */
   .range {
-    position: relative; background-color: var(--ring-track);
-    width: 100%; height: 0.5rem; border-radius: 0.25rem; overflow: hidden;
+    display: flex; gap: 2px;
+    width: 100%; height: 0.5rem;
+  }
+
+  .range-seg {
+    position: relative; flex: 0 1 0; /* flex-grow comes from the inline
+      per-section span; a zero basis keeps the gaps from skewing the
+      sections' relative widths */
+    height: 100%; background-color: var(--ring-track);
+    border-radius: 0.25rem; overflow: hidden;
   }
 
   .range .fill {
@@ -181,7 +362,7 @@
     transition: .5s all;
   }
 
-  .error-card { background: #fef2f2; }
+  .error-card { background: var(--error-surface); }
   .error-card .msg { font-size: 15px; color: var(--error); font-weight: 600; }
 
   .empty {

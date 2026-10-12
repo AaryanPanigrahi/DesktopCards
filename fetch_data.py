@@ -227,9 +227,6 @@ def fetch_item(client, item, force_logo_refresh=False):
             liab = liabilities_by_account.get(account["account_id"])
             limit = balances["limit"]
             entry["limit"] = limit
-            entry["percent_used"] = (
-                round((entry["balance"] / limit) * 100, 1) if limit else None
-            )
             due_date = liab.get("next_payment_due_date") if liab else None
             entry["next_payment_due_date"] = (
                 due_date.isoformat() if due_date else None

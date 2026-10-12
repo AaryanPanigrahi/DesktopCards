@@ -9,6 +9,10 @@ on Plaid for real account data.
 - Shows checking/savings accounts (logo, bank name, last 4 digits, balance)
   and credit cards (same, plus a usage bar and next payment due date).
   Logos come straight from Plaid (or the bank's own favicon as a fallback).
+- Colors the numbers by how much attention they deserve: credit card
+  utilization ramps grey → yellow → deep red as it climbs, and a
+  checking/savings balance that's nearly spent or overdrawn turns yellow or
+  red (see Warning colors below).
 - Sits pinned to a fixed spot on screen as a frameless, always-on window
   with no taskbar icon, and stays visible through Win+D ("show desktop").
 - Refreshes itself automatically — no manual resizing or repositioning
@@ -27,15 +31,15 @@ on Plaid for real account data.
 |---|---|
 | `plaid_link_setup.py` | One-time (per bank) setup — opens Plaid's real Link widget in a browser so you log into your bank directly; saves the resulting access token. |
 | `fetch_data.py` | Pulls balances + credit card details from Plaid for every linked account, writes `data.json`. The only script that talks to Plaid. Run on a schedule (see below), not continuously. |
-| `serve.py` | Minimal local web server so the dashboard page can read its JSON files. Serves only an explicit allowlist of files — `config.json` (which holds the Plaid secret and access tokens) is never reachable over HTTP. Also expands `theme.json` into what the page needs on every request. |
+| `serve.py` | Minimal local web server so the dashboard page can read its JSON files. Serves only an explicit allowlist of files — `config.json` (which holds the Plaid secret and access tokens) is never reachable over HTTP. Also expands `appearance.json` into what the page needs on every request. |
 | `widget.py` | Launches the pinned window itself: starts `serve.py`, opens a frameless WebView2 window at the configured position/size, hides it from the taskbar, pins it behind the desktop icons so it survives Win+D, clips it to rounded corners, and runs the system tray icon (Reload/Restart/Quit). |
 | `dashboard.html` / `dashboard.js` | The widget's UI and all its behavior (rendering, auto-refresh, auto-resize). |
-| `accent_color.py` | Reads your current Windows accent color and writes it into `theme.json`. |
+| `accent_color.py` | Reads your current Windows accent color and writes it into `appearance.json`. |
 | `setup_schedule.py` | Registers the Windows Task Scheduler job that runs `fetch_data.py` on a repeating interval. |
-| `theme.json` | Appearance, window placement, and layout/ordering settings, all in one file (see below). **Gitignored** — it holds your personal monitor position, same reasoning as `config.json`. |
-| `theme.example.json` | A placeholder-position template of `theme.json`, for the same sharing reason as `config.example.json`. |
+| `appearance.json` | Appearance, window placement, and layout/ordering settings, all in one file (see below). **Gitignored** — it holds your personal monitor position, same reasoning as `config.json`. |
+| `appearance.example.json` | A placeholder-position template of `appearance.json`, for the same sharing reason as `config.example.json`. |
 | `cache/logos/` | Cached institution logos (one PNG per bank). Gitignored, like `config.json`. |
-| `cache/config_snapshot.json`, `cache/theme_snapshot.json` | `config.json`/`theme.json` as of the end of the last run — how `fetch_data.py`/`widget.py` tell exactly what changed (see How a refresh actually happens). Gitignored. |
+| `cache/config_snapshot.json`, `cache/appearance_snapshot.json` | `config.json`/`appearance.json` as of the end of the last run — how `fetch_data.py`/`widget.py` tell exactly what changed (see How a refresh actually happens). Gitignored. |
 | `config.json` | Your Plaid credentials, access tokens, and the settings below. **Gitignored** — never committed. |
 | `config.example.json` | A credential-free template of `config.json`, meant for sharing this tool with someone else: they copy it to `config.json` and fill in their own values rather than yours. |
 
@@ -48,11 +52,11 @@ on Plaid for real account data.
 | `port` | Local port `serve.py` runs on. |
 | `fetch_interval_minutes` | How often `fetch_data.py` should run. Change this, then re-run `setup_schedule.py` to apply it. |
 
-## Appearance, window, and layout (`theme.json`)
+## Appearance, window, and layout (`appearance.json`)
 
 Kept separate from `config.json` — nothing here is a credential, but it is
 personal to your own screen setup, so it's gitignored the same way (see
-`theme.example.json` for the sharable, placeholder-position version).
+`appearance.example.json` for the sharable, placeholder-position version).
 
 | Key | Meaning |
 |---|---|
@@ -62,22 +66,183 @@ personal to your own screen setup, so it's gitignored the same way (see
 | `extra_spacing` | Breathing room applied to all four sides equally. Used when `custom_spacing` is `false`. Negative values pull content in tighter than the default. |
 | `custom_spacing` | `false` (default) uses `extra_spacing` on all sides. `true` switches to the per-side `spacing` object instead. |
 | `spacing.left` / `.top` / `.right` / `.bottom` | Independent breathing room per side, only used when `custom_spacing` is `true`. Negative values allowed. |
+| `shadow.enabled` | Turns on the hard offset drop shadow behind every card (plus a matching border around it). `false` leaves the cards flat. See Card shadow below. |
+| `shadow.offset` | How far the shadow is thrown down and to the right, in pixels. There's no blur — it's a solid block, so this is the whole of its size. |
+| `shadow.border` | Thickness of the outline drawn around each card in the same color, in pixels. `0` gives the shadow without the outline. |
+| `shadow.color` | Color of both the shadow and that border. Leave it out and it follows the theme — near-black on light, a darker near-black on dark. Setting it pins one color across both themes. |
+| `dark_theme` | `true` swaps the whole palette for the dark one. See Dark theme below. |
 | `window.x` / `.y` | Top-left corner of the widget, in screen pixels — pick a spot on whichever monitor you want it on. |
 | `window.survive_show_desktop` | Keeps the widget visible through Win+D ("show desktop"). |
 | `layout.depository.title` / `layout.credit.title` | The section header shown above each group of cards. |
 | `layout.depository.order` / `layout.credit.order` | Which cards appear (and in what order) within that section — a list of `"Bank Name,last4"` strings (e.g. `"Chase,0000"`), matched against what's actually on the dashboard. Accounts not listed just get appended at the end. |
+| `layout.depository.new_row_digit_threshold` | How many digits a checking/savings balance needs before that card drops onto a row of its own instead of sitting two-up (default `6`, i.e. $100,000+). See Oversized balances below. |
 
 Width and the max-height safety ceiling aren't configuration — they're fixed
 constants in `widget.py` (`WINDOW_WIDTH`, `MAX_HEIGHT`). There's no
 "natural" width to derive (text just reflows to whatever width it's given),
 and the actual height always comes from the page measuring its own
 rendered content, not from a tuned number. `extra_spacing`/`spacing` above
-is what controls breathing room.
+is what controls breathing room. The two things that *do* move the width
+are an oversized balance needing more room and `shadow` needing somewhere
+to paint — both described below.
 
-Editing `theme.json` takes effect on the dashboard's next load for
+## Oversized balances
+
+Checking/savings cards sit two per row, in a box sized for balances up to
+$9,999.9. Bigger numbers are handled the same way a long word is handled in
+a line of text — slightly too long and it stays on the line, far too long
+and it drops to its own line:
+
+- **5 digits** ($10,000–$99,999.9): that card's box widens in place and
+  keeps its row. Its row partner stays the width it already was, and the
+  window (and therefore the credit cards) grows by the same amount, so the
+  credit card and a full debit row stay the same width as each other.
+- **`new_row_digit_threshold` digits or more** (6+ by default, i.e.
+  $100,000+): that card drops onto a row of its own, as wide as a credit
+  card. It stays where it was in the order — the cards around it just pair
+  up again after it, rather than being reshuffled.
+
+Raising `new_row_digit_threshold` makes cards widen in place for longer
+before breaking out; lowering it makes them break out sooner. This applies
+to the default ordering and to a hand-written `layout.depository.order`
+alike.
+
+Editing `appearance.json` takes effect on the dashboard's next load for
 appearance — `serve.py` reads it fresh on every request, so there's no sync
 script to re-run. Window placement is read once at launch, so changes there
 need `widget.py` restarted.
+
+## Card shadow
+
+With `shadow.enabled`, each card gets a solid, un-blurred shadow thrown down
+and to the right, plus an outline in the same color — the neo-brutalist
+treatment from the Uiverse source card this UI started from (see References).
+Defaults reproduce that card exactly: a 10px offset, a 3px border, `#323232`.
+Smaller values (4px/2px) read as a subtler lift rather than a graphic slab.
+
+**The window grows to fit it.** A shadow is painted outside the card's own
+box, so without that the right-hand column of it would simply have been cut
+off at the window edge. The widget widens by `offset + border × 2` — the
+border counts twice because `box-sizing: border-box` otherwise takes it out
+of the card's *inner* width and squeezes the balance text. That number lives
+in two places that have to agree: `--shadow-grow` in `dashboard.html` (which
+widens the page) and `shadowGrow` in `dashboard.js` (which asks `widget.py`
+for a wider window, since that width is computed from `BASE_WIDTH` rather
+than measured from the rendered page).
+
+Those two halves of the growth go to different places, which matters more
+than it sounds: the **offset** is whitespace for the shadow to paint into, so
+it goes on `#cards`' right padding, while the **border** is width the cards
+give back to their own insides, so it goes to the content box. Putting the
+border on the padding too (as this first did) leaves a visibly wider gutter
+on the right than the left. Done properly, the gutter is 12px on both sides
+either way, and a credit card's inner width is identical shadowed or not.
+`--debit-base` and `debitBaseWidth()` in `dashboard.js` both have to carry
+that same border term, or a two-up checking/savings row ends short of the
+credit card above it. Side-by-side debit boxes do end up 3px narrower inside
+than unshadowed — the one squeeze that can't be given back without widening
+the window further.
+
+The gaps between cards grow by the offset too, otherwise each card would be
+painted over the shadow of the one above it. The one exception is the
+horizontal gap between two side-by-side checking/savings cards, which is
+pinned at 8px because `distributeRowWidths` does its arithmetic against it —
+so at a large offset the right-hand card covers the far end of its
+neighbour's shadow. That reads as the shadow tucking underneath it, which is
+what the style does anyway.
+
+## Dark theme
+
+`"dark_theme": true` and the whole widget swaps palette. It's one flag, not a
+set of colors, because every color the stylesheet paints already came from a
+`--surface-*` / `--text-*` variable — so the theme is a single
+`:root[data-theme="dark"]` block in `dashboard.html` that redefines those
+variables, and no rule below it needs a dark variant. `dashboard.js` only
+sets the attribute.
+
+Three things don't ride along on a CSS variable and are handled explicitly:
+
+- **The warning colors** (`WARN_PALETTES` in `dashboard.js`) are computed per
+  card and written as inline styles, so they can't come from the stylesheet.
+  There are two palettes with *identical hues*, the dark one lifted in
+  lightness and eased off in saturation: the deep red at 38% lightness that
+  reads as urgent on white is nearly invisible on a dark card, and the
+  fully-saturated yellow glows. Same hues in both is what keeps the two
+  themes feeling like one widget.
+- **The window's own fill** (`page_background` in `widget.py`) is the color
+  shown for the moment before the page paints, and in the sliver between the
+  page's rounded box and the window's clipped one. pywebview defaults it to
+  white, which flashed a bright frame on every launch and Restart. It tracks
+  `--surface-0` per theme.
+- **The shadow color**, which is why `SHADOW_DEFAULTS` in `dashboard.js` has
+  no color in it: an inline style written from JS beats the theme block and
+  would pin the light value in both themes, so the stylesheet owns that one.
+
+Some deliberate choices in the palette itself:
+
+- **Not black.** The cards sit one step lighter than the page behind them,
+  the same figure/ground step that white-on-grey gives in the light theme —
+  that step is what makes them read as cards instead of regions of one dark
+  sheet. A near-black page also makes the rounded corners dissolve into the
+  wallpaper rather than float on it.
+- **A cool blue-grey, not a neutral one**, to match the light theme's slate
+  text, so switching themes doesn't also change the widget's temperature.
+- **`--accent` is left alone.** It's your live Windows accent color;
+  recoloring it per theme would be overriding a choice you already made in
+  Windows itself.
+- **`--text-primary` stops short of `#fff`**, or the big balance numbers
+  bloom against the dark card.
+- **The card darkens a step when the shadow is off** (`[data-shadow="off"]`,
+  set by `applyShadow`). With the shadow on, its dark border wraps each card
+  in a thin frame that visually holds the surface down; without the frame,
+  the same grey reads as a brighter slab. The two states are different colors
+  so that they look equally bright. The page behind is untouched — it's the
+  card face that gains the brightness, not the whole widget. Light theme
+  needs none of this: on white, a borderless card reads as paper, which is
+  the point.
+
+Unlike window placement, this takes effect on the dashboard's next load — but
+`page_background` above is read at launch, so switching themes is worth a
+`widget.py` restart to avoid a light flash on the next one.
+
+## Warning colors
+
+All of it is computed in `dashboard.js` from the balances themselves —
+nothing about severity is stored in `data.json`, so there's no stale
+percentage to go out of sync with a freshly-fetched balance.
+
+**Credit utilization** (the `%` to the right of the balance, and the usage
+bar) shares one ramp:
+
+| Utilization | Color |
+|---|---|
+| Below 27% | Grey — nothing to look at |
+| 27–35% | Yellow |
+| 35% → 100% | Yellow ramping to deep red |
+| Above 100% | Stays deep red |
+
+The ramp deliberately front-loads its move toward red (`URGENCY_EXP`), so
+the middle of the range reads as a problem rather than a comfortable
+amber. Utilization can exceed 100%, and the color simply holds at its
+reddest there — there's nowhere redder to escalate to.
+
+The bar and the `%` run the same ramp, so they can't disagree about
+severity, but off two different yellows (`barYellow` vs `yellow`): a solid
+block of color and 13px text need different intensities of the same hue to
+look right. All four colors here come in a light and a dark version — same
+hues, different lightness (see Dark theme).
+
+**The usage bar's sections** are split at 27 / 35 / 66. The first two are
+exactly where the color changes, so a divider lands on each change of
+state; 66 marks the last third. Only the sections you've reached are
+drawn: at 10% utilization you see one divider (the 27% line coming up), at
+30% you see two (27 and 35). The stretch past the next divider stays one
+unbroken block, so the bar marks the line you're about to cross instead of
+laying out the whole ruler up front.
+
+**Checking/savings balances** turn yellow at $10 or below, and red below
+-$25 — the same yellow as a credit card's first warning band, since
+"watch this" means the same thing on either card.
 
 ## Logos
 
@@ -111,11 +276,11 @@ cost more than the actual Plaid calls did.
 
 Balances always get refreshed on "Reload" — that part's never skipped.
 What *is* skipped when nothing's actually different: `cache/config_snapshot.json`
-and `cache/theme_snapshot.json` hold each file's state as of the last run,
+and `cache/appearance_snapshot.json` hold each file's state as of the last run,
 so `fetch_data.py` only redoes a logo lookup for an item whose
 `institution_id`/`use_custom_logo`/`logo_url` actually changed (or that's
 brand new), and `widget.py` only re-clips/repositions the native window
-when `theme.json` actually differs from last time — both are otherwise
+when `appearance.json` actually differs from last time — both are otherwise
 silent no-ops instead of redundant work on every single click.
 
 ## Why a few of the design choices are what they are
@@ -129,7 +294,7 @@ silent no-ops instead of redundant work on every single click.
 - **Auto-resizing**: the window measures its own rendered content height
   after every refresh and resizes itself to match, capped at a maximum
   height. Adding or removing accounts, or changing `scale`/`extra_spacing`
-  in `theme.json`, never requires manually resizing the window again.
+  in `appearance.json`, never requires manually resizing the window again.
 - **Accent color**: pulled live from the Windows registry rather than
   hardcoded, so the dashboard's highlight color follows whatever accent
   color you have set in Windows' own personalization settings.
@@ -150,7 +315,11 @@ silent no-ops instead of redundant work on every single click.
 
 - The card layout (header row, balance, progress bar) is adapted from two
   community card designs on Uiverse.io: one for the debit/checking cards
-  and one for the credit cards (which adds the usage bar).
+  and one for the credit cards (which adds the usage bar). Their
+  hardcoded colors become your Windows accent throughout, and the usage
+  bar was reworked into the sectioned, severity-colored one described
+  under Warning colors. Their hard offset shadow and border is the
+  optional `shadow` setting (see Card shadow).
 - Institution logos are fetched live via Plaid's institution lookup, with a
   fallback to the bank's own public favicon, and cached locally so they're
   only ever fetched once per institution, not on every `fetch_data.py` run.

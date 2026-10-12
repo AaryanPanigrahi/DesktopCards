@@ -32,9 +32,9 @@ import pystray
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(PROJECT_DIR, "config.json")
-THEME_PATH = os.path.join(PROJECT_DIR, "theme.json")
+APPEARANCE_PATH = os.path.join(PROJECT_DIR, "appearance.json")
 CACHE_DIR = os.path.join(PROJECT_DIR, "cache")
-THEME_SNAPSHOT_PATH = os.path.join(CACHE_DIR, "theme_snapshot.json")
+APPEARANCE_SNAPSHOT_PATH = os.path.join(CACHE_DIR, "appearance_snapshot.json")
 
 WINDOW_TITLE = "Balances"
 PAGE = "dashboard.html"
@@ -45,10 +45,14 @@ PAGE = "dashboard.html"
 # { width: ... }, the actual design-width source of truth). max_height is a
 # safety ceiling (so a lot of accounts can't grow the window past a sane
 # size), not a tuned preference -- the actual height always comes from the
-# page measuring its own content. extra_spacing in theme.json is what
+# page measuring its own content. extra_spacing in appearance.json is what
 # controls breathing room, not these.
-WINDOW_WIDTH = 400
+WINDOW_WIDTH = 325
 MAX_HEIGHT = 700
+
+# This process's serve.py child. Module-level so the tray's 'Restart' can
+# shut it down before spawning the replacement widget -- see restart_now.
+SERVER = None
 
 
 def load_config():
@@ -56,25 +60,25 @@ def load_config():
         return json.load(f)
 
 
-def load_theme():
-    with open(THEME_PATH, "r") as f:
+def load_appearance():
+    with open(APPEARANCE_PATH, "r") as f:
         return json.load(f)
 
 
-def load_theme_snapshot():
-    """theme.json as of the end of the last reload, so refresh_now() can
-    tell whether the native window actually needs touching (corner
+def load_appearance_snapshot():
+    """appearance.json as of the end of the last reload, so refresh_now()
+    can tell whether the native window actually needs touching (corner
     radius, position) instead of reapplying it unconditionally."""
-    if not os.path.exists(THEME_SNAPSHOT_PATH):
+    if not os.path.exists(APPEARANCE_SNAPSHOT_PATH):
         return None
-    with open(THEME_SNAPSHOT_PATH, "r") as f:
+    with open(APPEARANCE_SNAPSHOT_PATH, "r") as f:
         return json.load(f)
 
 
-def save_theme_snapshot(theme):
+def save_appearance_snapshot(appearance):
     os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(THEME_SNAPSHOT_PATH, "w") as f:
-        json.dump(theme, f, indent=2)
+    with open(APPEARANCE_SNAPSHOT_PATH, "w") as f:
+        json.dump(appearance, f, indent=2)
 
 
 def apply_rounded_corners(window, radius):
@@ -197,7 +201,7 @@ def pin_to_desktop(window):
 def build_tray_image(accent):
     """A plain colored circle, drawn with PIL rather than bundling an icon
     file -- one less asset to ship, and it automatically matches whatever
-    accent color theme.json has."""
+    accent color appearance.json has."""
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -209,13 +213,14 @@ def refresh_now(port, window):
     """Tray 'Reload': always re-pulls from Plaid (serve.py's /refresh
     re-reads config.json fresh and re-runs fetch_data.main() in-process --
     no skipping that, by design) and always tells the page to re-fetch
-    data.json + theme.json (reloadAll() -- cheap either way, since it's
-    just a local fetch + a few CSS variable writes). The native-window
-    side (corner radius clip, position) is the part worth gating: those
-    are real OS calls, not just local JS, so they only run when theme.json
-    actually differs from the last reload's snapshot -- the common case
-    (hit Reload just to see fresh balances, nothing about the theme
-    changed) skips them entirely instead of redoing a no-op every time.
+    data.json + appearance.json (reloadAll() -- cheap either way, since
+    it's just a local fetch + a few CSS variable writes). The native-window
+    side (corner radius clip, position) is the part worth gating: those are
+    real OS calls, not just local JS, so they only run when
+    appearance.json actually differs from the last reload's snapshot -- the
+    common case (hit Reload just to see fresh balances, nothing about the
+    appearance changed) skips them entirely instead of redoing a no-op
+    every time.
     survive_show_desktop is deliberately never touched here at all --
     re-pinning (or un-pinning) onto the WorkerW layer is a bigger, more
     disruptive operation than this quick action should trigger; use
@@ -228,26 +233,37 @@ def refresh_now(port, window):
         return
     window.evaluate_js("reloadAll()")
 
-    theme = load_theme()
-    if theme != load_theme_snapshot():
-        win = theme.get("window", {})
-        apply_rounded_corners(window, theme.get("corner_radius", 0))
+    appearance = load_appearance()
+    if appearance != load_appearance_snapshot():
+        win = appearance.get("window", {})
+        apply_rounded_corners(window, appearance.get("corner_radius", 0))
         window.move(win.get("x", 100), win.get("y", 100))
     # Written every time regardless -- otherwise the snapshot only ever
     # reflects whichever reload last found a change, not "the state as of
     # the most recent reload" like its name implies.
-    save_theme_snapshot(theme)
+    save_appearance_snapshot(appearance)
 
 
 def restart_now(icon, window):
     """Tray 'Restart': a full process relaunch, for the handful of
     settings 'Reload' deliberately doesn't touch (survive_show_desktop,
-    or anything else that's only ever read once at startup). Spawns a
-    fresh widget.py (which starts its own new serve.py), then tears this
-    one down -- same shutdown path as a normal exit (webview.start()
-    returns once the window is destroyed, then main() terminates this
-    process's own serve.py)."""
+    or anything else that's only ever read once at startup).
+
+    Our own serve.py is terminated here, before the replacement widget is
+    spawned, rather than being left to main()'s post-webview.start()
+    cleanup. Spawning first raced the new process against this one for the
+    port: serve.py sets allow_reuse_address = False (deliberately, so a
+    second instance can't silently bind on top of a live one), so the new
+    serve.py died on startup and the new widget silently kept talking to
+    the old process -- which then outlived the widget that owned it as an
+    orphan holding the port, surviving every later restart."""
     icon.stop()
+    if SERVER is not None:
+        SERVER.terminate()
+        try:
+            SERVER.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            SERVER.kill()
     subprocess.Popen(
         [sys.executable.replace("python.exe", "pythonw.exe"), "widget.py"],
         cwd=PROJECT_DIR,
@@ -255,8 +271,8 @@ def restart_now(icon, window):
     window.destroy()
 
 
-def make_tray_icon(port, window, theme):
-    image = build_tray_image(theme.get("accent", "#0078d4"))
+def make_tray_icon(port, window, appearance):
+    image = build_tray_image(appearance.get("accent", "#0078d4"))
 
     def on_reload(icon, item):
         threading.Thread(target=refresh_now, args=(port, window), daemon=True).start()
@@ -277,14 +293,22 @@ def make_tray_icon(port, window, theme):
 
 
 def main():
+    global SERVER
     config = load_config()
-    theme = load_theme()
-    save_theme_snapshot(theme)  # baseline for the first Reload's diff
+    appearance = load_appearance()
+    save_appearance_snapshot(appearance)  # baseline for the first Reload's diff
     port = config.get("port", 5000)
-    win = theme.get("window", {})
-    corner_radius = theme.get("corner_radius", 0)
+    win = appearance.get("window", {})
+    corner_radius = appearance.get("corner_radius", 0)
+    # The window's own fill, shown for the moment before the page paints and
+    # in the sliver between body's rounded box and the window's (clipped)
+    # square one. pywebview's default is white, which flashes as a bright
+    # frame on every launch and Restart under the dark theme. These two
+    # values are deliberately the same as --surface-0 in each theme
+    # (dashboard.html), so there's no visible seam where one ends.
+    page_background = "#1d2128" if appearance.get("dark_theme") else "#f3f4f6"
 
-    server = subprocess.Popen(
+    SERVER = subprocess.Popen(
         [sys.executable.replace("python.exe", "pythonw.exe"), "serve.py"],
         cwd=PROJECT_DIR,
     )
@@ -301,9 +325,10 @@ def main():
         easy_drag=False,  # no drag region -- it swallowed clicks meant for
                            # the page underneath, since drag-region hit-
                            # testing runs before the page's own pointer
-                           # events. Position is fixed via theme.json's
+                           # events. Position is fixed via appearance.json's
                            # window.x/y instead.
         on_top=False,
+        background_color=page_background,
     )
     api = Api(window, MAX_HEIGHT, corner_radius)
     window.expose(api.resize_window)
@@ -314,12 +339,14 @@ def main():
     if win.get("survive_show_desktop", True):
         window.events.shown += lambda: pin_to_desktop(window)
 
-    tray = make_tray_icon(port, window, theme)
+    tray = make_tray_icon(port, window, appearance)
     threading.Thread(target=tray.run, daemon=True).start()
     window.events.closing += lambda: tray.stop()
 
     webview.start()
-    server.terminate()
+    # Already torn down if we got here via the tray's 'Restart'.
+    if SERVER.poll() is None:
+        SERVER.terminate()
 
 
 if __name__ == "__main__":
