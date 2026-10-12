@@ -17,13 +17,65 @@ on Plaid for real account data.
   with no taskbar icon, and stays visible through Win+D ("show desktop").
 - Refreshes itself automatically — no manual resizing or repositioning
   needed as accounts are added or removed.
-- A system tray icon gives you "Reload" (re-pull from Plaid right now),
-  "Restart" (relaunch the whole widget — for settings that only apply at
-  startup, like `survive_show_desktop`), and "Quit" — the widget itself
-  can't be clicked while pinned through Win+D (see Why below), so this is
-  the manual control surface.
+- A system tray icon gives you **Reload** (re-pull from Plaid right now),
+  **Modify Accounts** (add or remove a bank), **Restart** (relaunch the
+  whole widget — for settings that only apply at startup, like
+  `survive_show_desktop`), and **Quit**. The widget itself can't be clicked
+  while pinned through Win+D (see Why below), so this is the manual control
+  surface.
 - The time-since-last-refresh display also counts down the minutes left
   until the next scheduled refresh.
+
+## Getting started
+
+You need your own free [Plaid](https://dashboard.plaid.com) developer
+account — this uses your credentials, not someone else's. Setup walks you
+through it.
+
+**From a packaged build** (what you'd hand to someone else):
+
+1. Run `DesktopCards-Setup.exe`. It opens a page in your browser.
+2. Follow the five steps: Plaid credentials, link your banks, a test fetch,
+   install, launch.
+
+It installs itself to `%LOCALAPPDATA%\DesktopCards\` with a Start-menu
+shortcut, and optionally starts with Windows. Unsigned, so the first run
+trips SmartScreen — *More info → Run anyway*. See
+[Setup, and adding accounts later](#setup-and-adding-accounts-later).
+
+**From source:**
+
+```
+pip install -r requirements.txt
+python desktopcards.py --setup     # first time: credentials + link banks
+pythonw desktopcards.py            # run the widget
+```
+
+`pythonw` rather than `python` so there's no console window behind the
+widget. `desktopcards.py` is the only entry point — every mode is a flag on
+it (`--serve`, `--fetch`, `--link`, `--accent`, `--setup`, or nothing for
+the widget).
+
+To build the exe yourself: `python build.py` (see
+[Building the executable](#building-the-executable)).
+
+## Where your files live
+
+Two directories, and which is which depends on how you're running it:
+
+| | From source | Packaged build |
+|---|---|---|
+| **Code and assets** (read-only) | the repo folder | inside the exe, unpacked to a temp dir per launch |
+| **Your data** (`config.json`, `appearance.json`, `data.json`, `cache/`, `desktopcards.log`) | the repo folder | `%LOCALAPPDATA%\DesktopCards\` |
+
+From source they're the same folder, which is why an existing checkout just
+works with no migration. `paths.py` owns this split; a packaged build
+*requires* it, because anything written into that temp directory is deleted
+when the app exits.
+
+**The gotcha worth knowing:** if you're running the packaged build, editing
+`appearance.json` in the repo does nothing — the exe reads the copy in
+`%LOCALAPPDATA%\DesktopCards\`. Edit that one, then tray → Restart.
 
 ## Pieces
 
@@ -32,7 +84,7 @@ on Plaid for real account data.
 | `plaid_link_setup.py` | One-time (per bank) setup — opens Plaid's real Link widget in a browser so you log into your bank directly; saves the resulting access token. |
 | `fetch_data.py` | Pulls balances + credit card details from Plaid for every linked account, writes `data.json`. The only script that talks to Plaid. Runs on an interval timer inside the widget, not continuously. |
 | `serve.py` | Minimal local web server so the dashboard page can read its JSON files. Serves only an explicit allowlist of files — `config.json` (which holds the Plaid secret and access tokens) is never reachable over HTTP. Also expands `appearance.json` into what the page needs on every request. Normally hosted as a thread inside `widget.py`; still runnable on its own for debugging the page. |
-| `widget.py` | Launches the pinned window itself: hosts the server, opens a frameless WebView2 window at the configured position/size, hides it from the taskbar, pins it behind the desktop icons so it survives Win+D, clips it to rounded corners, runs the interval fetch, and runs the system tray icon (Reload/Restart/Quit). |
+| `widget.py` | Launches the pinned window itself: hosts the server, opens a frameless WebView2 window at the configured position/size, hides it from the taskbar, pins it behind the desktop icons so it survives Win+D, clips it to rounded corners, runs the interval fetch, and runs the system tray icon (Reload / Modify Accounts / Restart / Quit). |
 | `dashboard.html` / `dashboard.js` | The widget's UI and all its behavior (rendering, auto-refresh, auto-resize). |
 | `paths.py` | Where every file lives. Splits read-only bundled assets from writable per-user data, which a packaged build requires and a source checkout collapses back into one folder. |
 | `platform_win.py` | Every Windows-specific call in one file — rounded-corner clipping, taskbar hiding, desktop pinning, the accent-colour registry read. Isolated so another platform means writing a sibling, not unpicking this one. |
@@ -41,6 +93,9 @@ on Plaid for real account data.
 | `setup_app.py` | First-run setup and the management view, as a local web page — credentials, Plaid Link, a verifying fetch, install and shortcuts. |
 | `logo_cache.py` | Caches the derived copies of `logo.png` (tray PNG, shortcut `.ico`) in `cache/`. |
 | `build.py` / `DesktopCards.spec` / `make_icon.py` | Produce `dist/DesktopCards.exe` — see Building the executable. |
+| `logo.png` | The single source of truth for the app's mark — exe icon, Start-menu shortcut, and tray icon all derive from it. `logo2.png` is an unused alternate. |
+| `mac_port.md` | What a macOS port would actually involve. Planning notes, not a commitment. |
+| `finance-dashboard-spec.md` | The original spec this was built from. Historical — the README is the current description. |
 | `appearance.json` | Appearance, window placement, and layout/ordering settings, all in one file (see below). **Gitignored** — it holds your personal monitor position, same reasoning as `config.json`. |
 | `appearance.example.json` | A placeholder-position template of `appearance.json`, for the same sharing reason as `config.example.json`. |
 | `cache/logos/` | Cached institution logos (one PNG per bank). Gitignored, like `config.json`. |
