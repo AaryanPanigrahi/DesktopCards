@@ -1,0 +1,8 @@
+{
+  "client_id": "YOUR_PLAID_CLIENT_ID",
+  "secret": "YOUR_PLAID_SECRET",
+  "environment": "production",
+  "port": 5000,
+  "fetch_interval_minutes": 90,
+  "items": []
+}

@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Balances</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0:      #f3f4f6;
+    --surface-1:      #ffffff;
+    --surface-2:      #e5e7eb;
+    --text-primary:   #1f2937;
+    --text-secondary: #374151;
+    --text-muted:     #6b7280;
+    --text-faint:     #9ca3af;
+    --ring-track:      #e5e7eb;
+    --accent:          #c9b7e8; /* overridden at runtime from theme.json (Windows accent color); also stands in for the hardcoded green/red in the Uiverse source cards */
+    --error:           #ef4444;
+    --scale:           1; /* overridden at runtime from theme.json */
+    --corner-radius:   20px; /* overridden at runtime from theme.json */
+  }
+
+  * { box-sizing: border-box; }
+
+  /* html is the full (rectangular) window surface -- kept transparent so
+     the corners that fall outside body's rounded box (clipped at the OS
+     level in widget.py via SetWindowRgn) show the desktop through, instead
+     of a square white/black frame around a rounded card. */
+  html {
+    margin: 0; padding: 0; background: transparent; overflow: hidden;
+  }
+
+  /* body is auto-sized on both axes -- it has no explicit width/height of
+     its own, so it naturally grows/shrinks in BOTH dimensions to exactly
+     match #shell's zoomed size (the same reason body.scrollHeight already
+     reports the correctly-scaled height: zoom changes how much space a
+     zoomed box occupies in its own parent's layout, not just how it's
+     painted). Giving body its own fixed width here instead would leave it
+     a step behind #shell's zoomed width -- shrunk content floating in a
+     too-wide box, or wider content clipped by a too-narrow one. */
+  body {
+    margin: 0; padding: 0;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    overflow: hidden;
+    border-radius: var(--corner-radius);
+    width: auto; height: auto; max-height: 700px;
+  }
+
+  /* #shell itself stays width:auto -- zoom rescales what's *inside* an
+     element, it doesn't reinterpret that element's own declared size. The
+     400px design-width anchor has to live on #cards (inside the zoomed
+     subtree) instead: zoom then renders "400px" at 400*scale actual
+     pixels, and #shell's auto width naturally wraps that real rendered
+     size, which is what propagates out to body (see body's comment).
+     Putting width:400px directly on #shell left #shell always exactly
+     400px wide regardless of scale (an explicit length on the zoomed
+     element isn't itself rescaled), which is the whitespace/clipping bug
+     this replaces. extra_spacing (theme.json) sets #shell's margin at
+     runtime -- margin (not padding) so negative values can pull content
+     in past the card edges; overflow:hidden on html/body above prevents
+     it from collapsing with body's own box. */
+  #shell { margin: 0; zoom: var(--scale); }
+
+  #cards {
+    width: 400px;
+    max-height: 700px;
+    overflow-y: auto; padding: 10px 12px 10px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+
+  #cards::-webkit-scrollbar { width: 6px; }
+  #cards::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 3px; }
+
+  .section { display: flex; flex-direction: column; gap: 6px; }
+
+  .section-title {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 10px; font-weight: 600; color: var(--text-faint);
+    text-transform: uppercase; letter-spacing: 0.07em; padding: 2px 4px;
+  }
+
+  /* A real sibling of the title text inside the same (zoomed) section-title
+     row, not an overlay positioned relative to the unscaled viewport --
+     that's what let it drift out of alignment whenever scale != 1. */
+  #updated {
+    font-variant-numeric: tabular-nums; text-transform: none;
+    letter-spacing: normal; font-weight: 500;
+  }
+
+
+  /* Card sizing/colors below are copied close to the two Uiverse.io source
+     cards almost verbatim (padding, radius, font sizes, the 1rem rhythm
+     between header/balance/bar) -- see README References. The one swap is
+     their hardcoded green/red becomes var(--accent) throughout, so it
+     tracks your live Windows accent color instead. */
+  .card {
+    background: var(--surface-1);
+    border-radius: 20px;
+    padding: 1rem;
+  }
+
+  .card-head {
+    display: flex; align-items: center;
+  }
+
+  /* Two per row for Checking & Savings -- these cards are short enough
+     (logo/name/balance, no bar or due date) that a single column wastes
+     the right half of the window. aspect-ratio keeps them closer to a
+     square (leaning landscape, ~4:3) instead of a thin thumbnail-shaped
+     strip; justify-content centers the two lines of content inside that
+     taller shape instead of leaving them stuck to the top. */
+  .card-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  }
+  .card-grid .card {
+    padding: 0.85rem; aspect-ratio: 4 / 3;
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .card-grid .balance { margin: 0.6rem 0 0; font-size: 1.6rem; line-height: 1.8rem; }
+
+  .card-logo {
+    width: 1.5rem; height: 1.5rem; border-radius: 9999px; flex-shrink: 0;
+    object-fit: cover; background: var(--surface-2);
+  }
+
+  .card-logo-fallback {
+    width: 1.5rem; height: 1.5rem; border-radius: 9999px; flex-shrink: 0;
+    background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700;
+  }
+
+  .bank-name {
+    margin-left: 0.5rem; color: var(--text-secondary); font-size: 18px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    flex: 0 1 auto; min-width: 0; /* shrink-to-fit only -- no flex-grow, so a
+      sibling's margin-left:auto (card-mask or due-inline) is the one that
+      claims the row's leftover space, not this */
+  }
+
+  .card-grid .bank-name { font-size: 15px; }
+
+  .card-mask {
+    margin-left: 0.5rem; color: var(--accent); font-weight: 600;
+    flex-shrink: 0; font-variant-numeric: tabular-nums;
+  }
+
+  /* Debit cards only -- last-4 drops to its own line under the header
+     instead of widening that row, so the header can stay narrow/truncate
+     sooner. Indented to line up under the bank name, past the logo. */
+  .card-mask-line {
+    margin: 2px 0 0 2rem; color: var(--accent); font-weight: 600;
+    font-size: 11px; font-variant-numeric: tabular-nums;
+  }
+
+  .due-inline {
+    margin-left: auto; flex-shrink: 0;
+    font-size: 12px; color: var(--text-muted); font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .balance {
+    margin: 0.85rem 0; color: var(--text-primary);
+    font-size: 2.25rem; line-height: 2.5rem; font-weight: 700;
+    font-variant-numeric: tabular-nums; text-align: left;
+  }
+
+  .of-limit { color: var(--text-muted); font-size: 15px; font-weight: 400; }
+
+  .range {
+    position: relative; background-color: var(--ring-track);
+    width: 100%; height: 0.5rem; border-radius: 0.25rem; overflow: hidden;
+  }
+
+  .range .fill {
+    position: absolute; top: 0; left: 0; height: 100%;
+    background-color: var(--accent); border-radius: 0.25rem;
+    transition: .5s all;
+  }
+
+  .error-card { background: #fef2f2; }
+  .error-card .msg { font-size: 15px; color: var(--error); font-weight: 600; }
+
+  .empty {
+    text-align: center; color: var(--text-muted); font-size: 13px;
+    margin-top: 60px; padding: 0 20px;
+  }
+</style>
+</head>
+<body>
+  <div id="shell">
+    <div id="cards">
+      <div class="empty">Loading&hellip;</div>
+    </div>
+  </div>
+<script src="dashboard.js"></script>
+</body>
+</html>

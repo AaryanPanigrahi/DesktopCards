@@ -1,0 +1,30 @@
+{
+  "accent": "#0078d4",
+  "corner_radius": 20,
+  "scale": 1.0,
+  "extra_spacing": 0,
+  "custom_spacing": false,
+  "spacing": {
+    "left": 0,
+    "top": 0,
+    "right": 0,
+    "bottom": 0
+  },
+  "window": {
+    "x": 100,
+    "y": 100,
+    "survive_show_desktop": true
+  },
+  
+  "layout": {
+    "_comment": "Format: <Bank_Name>,<Last_4_Digits>",
+    "depository": {
+      "title": "Checking & Savings",
+      "order": []
+    },
+    "credit": {
+      "title": "Credit Cards",
+      "order": []
+    }
+  }
+}
