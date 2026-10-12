@@ -71,6 +71,8 @@ personal to your own screen setup, so it's gitignored the same way (see
 | `shadow.border` | Thickness of the outline drawn around each card in the same color, in pixels. `0` gives the shadow without the outline. |
 | `shadow.color` | Color of both the shadow and that border. Leave it out and it follows the theme — near-black on light, a darker near-black on dark. Setting it pins one color across both themes. |
 | `dark_theme` | `true` swaps the whole palette for the dark one. See Dark theme below. |
+| `translucent_background` | `true` lets the desktop wallpaper show through the widget. See Translucency below. |
+| `opacity` | How opaque the widget is, `0`–`1`, when `translucent_background` is on. Not applied uniformly — the page backdrop takes this value in full and the cards, bars and text give up progressively less of theirs, so text stays readable. `1` switches the whole effect off (see Translucency), and anything below `0.15` is clamped to it. |
 | `window.x` / `.y` | Top-left corner of the widget, in screen pixels — pick a spot on whichever monitor you want it on. |
 | `window.survive_show_desktop` | Keeps the widget visible through Win+D ("show desktop"). |
 | `layout.depository.title` / `layout.credit.title` | The section header shown above each group of cards. |
@@ -173,7 +175,8 @@ Three things don't ride along on a CSS variable and are handled explicitly:
   shown for the moment before the page paints, and in the sliver between the
   page's rounded box and the window's clipped one. pywebview defaults it to
   white, which flashed a bright frame on every launch and Restart. It tracks
-  `--surface-0` per theme.
+  `--surface-0` per theme. (Translucency makes this moot — a transparent
+  window has no fill at all. See Translucency.)
 - **The shadow color**, which is why `SHADOW_DEFAULTS` in `dashboard.js` has
   no color in it: an inline style written from JS beats the theme block and
   would pin the light value in both themes, so the stylesheet owns that one.
@@ -205,6 +208,141 @@ Unlike window placement, this takes effect on the dashboard's next load — but
 `page_background` above is read at launch, so switching themes is worth a
 `widget.py` restart to avoid a light flash on the next one.
 
+## Translucency
+
+`"translucent_background": true` plus an `"opacity"` between `0` and `1` lets
+the desktop wallpaper show through the widget. It takes both halves to work,
+and they fail in opposite directions if only one is done:
+
+- **The window** has to stop painting a background, or the page's `rgba`
+  colors have nothing to blend against but the window's own fill — the
+  wallpaper is on the far side of the *window*, not the far side of the card.
+  `widget.py` passes `transparent=True`, which pywebview's WinForms backend
+  turns into `DefaultBackgroundColor = Color.Transparent` on the WebView2
+  control. That gives genuine per-pixel alpha, not chroma-keying or a uniform
+  window opacity, which is what makes a graded effect possible at all. Because
+  the window is reparented onto WorkerW, what's behind it is the wallpaper.
+- **The page** has to actually use alpha. Every color token in
+  `dashboard.html` is now a `*-raw` name, and nothing downstream uses one
+  directly: a derivation block turns each into the var the rules paint with,
+  via `color-mix(in srgb, <raw> calc(var(--alpha-x) * 100%), transparent)`.
+  That's what kept this to a token-layer change instead of an edit to all
+  sixty-odd color usages, and `color-mix` against `transparent` is what lets
+  it take a color in any format — these are hex, and `--accent-raw` is
+  whatever `appearance.json` hands over.
+
+### Four tiers, not one opacity
+
+A single alpha applied uniformly reads as a faded screenshot rather than a
+translucent panel, and the text becomes unreadable long before the effect
+looks good. So one input drives four tiers, each giving back a fraction of
+what was asked for (`TRANSLUCENCY_TIERS` in `dashboard.js`):
+
+| tier | gives back | at `opacity: 0.8` |
+| --- | --- | --- |
+| page backdrop | nothing | 0.800 |
+| card faces, shadow | 45% | 0.890 |
+| accent, bars, bar track, logos | 80% | 0.960 |
+| all text | 88% | 0.976 |
+
+The page backdrop is the thing actually being made see-through, so it takes
+the number at face value. Card faces give up most of theirs, since a card has
+to still read as a slab sitting on the wallpaper rather than a tint of it. The
+accent and text tiers give up only a little, because legibility against an
+arbitrary wallpaper is the one thing translucency mustn't cost — but they do
+give up some, so they belong to the same surface as everything else instead of
+floating above it.
+
+Two tier assignments are deliberate and non-obvious: the **shadow** follows the
+card rather than the page, because it's an edge belonging to the card that cast
+it and at page alpha it washed out while the card above it still read as solid;
+and the **bar's track** is on the accent tier rather than the surface one, so
+the whole progress bar fades as a single object instead of its background
+dropping out from under its fill.
+
+Three things can't ride on a CSS variable:
+
+- **The warning colors**, same as in the dark theme — computed per card and
+  written inline. They carry the accent tier's alpha through `hsl()` instead.
+  `WARN_PALETTES.grey` became an `[h, s, l]` array like the other three for
+  this: as a finished string it was the one color that would have stayed
+  opaque while the rest went translucent.
+- **The institution logos**, which are `<img>` elements rather than colors, so
+  `.card-logo` takes the accent tier's alpha as an element `opacity`. Without
+  it the logos stay fully solid while everything around them fades.
+- **The section headings and the `updated` clock**, which get their own
+  treatment below.
+
+### The headings darken as it fades
+
+Those two are the only text in the widget sitting on the page backdrop rather
+than on a card, so at low opacity their real background is your wallpaper. A
+faint grey that reads as a quiet label against a solid page turns into
+unreadable haze over an arbitrary photo. So `--text-faint` is two nested
+mixes: pulled toward near-black by `--heading-darken` *first*, then given the
+text tier's alpha, so the darkening doesn't get diluted by it.
+`--heading-darken` is `0` at full opacity and scales with how much opacity was
+given up, capped at `HEADING_DARKEN_MAX = 0.7` — a pure black heading above
+pale card text looks like a different widget's label pasted on top. Both
+themes get this: in the dark theme the page is barely there at low opacity
+anyway, so the heading's backdrop is the wallpaper either way.
+
+### Off means off
+
+`translucent_background: false` **or** `opacity: 1` switches the whole thing
+off, in both files, and they have to agree — disagreeing would blend the page
+into a window that isn't transparent (grey behind the cards) or vice versa. A
+fully opaque translucency is translucency's cost with none of its effect, so
+it's treated as off rather than honored literally.
+
+Off is not just the alphas set to `1`. That would look identical but wouldn't
+be free:
+
+- In the page, a `:root[data-translucent="off"]` block maps every token
+  straight through to its raw value, so none of the twelve `color-mix()` calls
+  are in the chain at all. They're real work on each style recalc, and a
+  `color-mix` result carries an alpha channel even at `1.000`, which keeps the
+  card and page backgrounds on the compositor's blended path instead of
+  letting it treat them as opaque fills. The attribute is seeded in the markup
+  next to `data-shadow`, so the cheap path is also what you get before
+  `dashboard.js` runs.
+- In the window, `transparent=True` simply isn't passed. A transparent window
+  is composited per-pixel against the desktop for its whole lifetime whether
+  or not anything in the page is see-through.
+
+On the off path `dashboard.js` *removes* the `--alpha-*` properties rather
+than setting them to `1`: they're inline styles on `<html>`, so leaving them
+behind would outrank the stylesheet's own values for the rest of the session,
+and a tray Reload that turned the flag off would keep the old alphas alive.
+
+The `0.15` floor on `opacity` exists because the widget is pinned to the
+desktop layer and takes no mouse input — an opacity of `0` would render it
+invisible with nothing left to click to undo it. A non-numeric value falls
+back to fully opaque rather than guessing.
+
+### A hazard worth knowing about
+
+A transparent window on WorkerW has no background brush to erase with, and
+when it shrinks, the thing that would have to repaint underneath is the
+desktop, which never finds out it should — so the previous frame's pixels can
+be left stranded outside the window's new bounds. `erase_vacated_area` in
+`widget.py` handles that: `resize_window` captures the window rect *before*
+resizing, then `RedrawWindow`s that region on the parent with
+`RDW_ERASE | RDW_UPDATENOW`. It only runs when translucent, since an opaque
+window gets this from DWM for free, and it no-ops when `survive_show_desktop`
+is off because an unparented window doesn't have the problem.
+
+Honest caveat: this was written for a ghost-text symptom that turned out to
+have a completely different cause (stray text outside an HTML comment), so
+while the mechanism is real, the code is **unverified against an actual
+occurrence**. `SetWindowRgn` is worth noting here too — clipping the window
+stops *it* painting outside its bounds, which is what would let such pixels
+end up orphaned rather than overwritten.
+
+Like the theme, the page side applies on the next dashboard load, but the
+window side is set at `create_window` time — so toggling translucency needs a
+`widget.py` restart (the tray's **Restart**), not just a Reload.
+
 ## Warning colors
 
 All of it is computed in `dashboard.js` from the balances themselves —
@@ -230,7 +368,9 @@ The bar and the `%` run the same ramp, so they can't disagree about
 severity, but off two different yellows (`barYellow` vs `yellow`): a solid
 block of color and 13px text need different intensities of the same hue to
 look right. All four colors here come in a light and a dark version — same
-hues, different lightness (see Dark theme).
+hues, different lightness (see Dark theme) — and all four are `[h, s, l]`
+arrays rather than finished color strings, so that `hsl()` can add the
+translucency alpha on the way out (see Translucency).
 
 **The usage bar's sections** are split at 27 / 35 / 66. The first two are
 exactly where the color changes, so a divider lands on each change of
@@ -282,6 +422,30 @@ so `fetch_data.py` only redoes a logo lookup for an item whose
 brand new), and `widget.py` only re-clips/repositions the native window
 when `appearance.json` actually differs from last time — both are otherwise
 silent no-ops instead of redundant work on every single click.
+
+### Restart and the port
+
+The tray's **Restart** is a full process relaunch, for the settings that are
+only read once at startup (`survive_show_desktop`, `translucent_background`,
+`page_background`). It kills its own `serve.py` before spawning the
+replacement widget — spawning first raced the two processes for the port.
+
+The replacement then can't just assume its own `serve.py` came up.
+`serve.py` sets `allow_reuse_address = False` deliberately, so a second
+instance can't quietly bind on top of a live one, which also means the
+previous instance's listening socket sitting in `TIME_WAIT` makes the bind
+fail outright — and Restart lands well inside that window. This used to be a
+flat `time.sleep(1)`, which made the failure silent and baffling: `serve.py`
+died, the sleep expired anyway, and the window came up pointed at a port with
+nothing behind it, so the widget just disappeared with no error anywhere (both
+processes run under `pythonw`, so there's no console to print to).
+
+`start_server()` in `widget.py` replaces that sleep: it spawns `serve.py` and
+polls until the port actually answers, retrying with increasing backoff if the
+child exits — `TIME_WAIT` is a wait-it-out problem, not one that retrying
+faster solves. If the server is running but not yet answering it's handed over
+anyway, since the page retries its own fetches and killing a live server would
+only put us back in the hole.
 
 ## Why a few of the design choices are what they are
 

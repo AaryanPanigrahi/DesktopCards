@@ -40,15 +40,19 @@ function fmtMask(mask) {
 // red that reads as urgent against white is nearly invisible on a dark
 // card, and a fully saturated yellow on dark glows. Keeping the hues
 // identical is what makes the two themes feel like the same widget.
+// All four are [h, s, l] arrays, including grey -- it used to be a finished
+// string, but since every one of them now has to come back out of hsl()
+// carrying the current alpha, having one that skipped that step meant the
+// one color below 27% stayed opaque while the rest went translucent.
 const WARN_PALETTES = {
   light: {
-    grey:       'hsl(220, 9%, 46%)',
+    grey:       [220, 9, 46],
     yellow:     [45, 55, 50],
     barYellow:  [45, 90, 48],
     red:        [0, 80, 38],
   },
   dark: {
-    grey:       'hsl(220, 9%, 62%)',
+    grey:       [220, 9, 62],
     yellow:     [45, 68, 60],
     barYellow:  [45, 85, 55],
     red:        [0, 72, 54],
@@ -60,7 +64,19 @@ const WARN_PALETTES = {
 let currentWarn = WARN_PALETTES.light;
 const warn = () => currentWarn;
 
-const hsl = ([h, s, l]) => `hsl(${h}, ${s}%, ${l}%)`;
+// These colors are written as inline styles, so they can't ride on the
+// stylesheet's --alpha-* tokens the way every other color does (see
+// dashboard.html). They're percent readouts and bar fills, so they take the
+// accent tier -- the same one the bars' track and the card numbers use, so
+// a bar's fill and the track behind it fade together. Set by
+// applyTranslucency; 1 until then, which emits plain hsl() exactly as
+// before.
+let warnAlpha = 1;
+
+const hsl = ([h, s, l]) =>
+  warnAlpha >= 1
+    ? `hsl(${h}, ${s}%, ${l}%)`
+    : `hsl(${h} ${s}% ${l}% / ${warnAlpha})`;
 
 // How hard the yellow->red ramp front-loads its move toward red. Below 1
 // the hue leaves yellow fast and spends most of the range in the urgent
@@ -75,7 +91,7 @@ const URGENCY_EXP = 0.5;
 // bar run the same ramp off their own yellow, so they always agree on
 // how bad things are even though they disagree on intensity.
 function utilRamp(pct, yellow) {
-  if (pct < 27) return warn().grey;
+  if (pct < 27) return hsl(warn().grey);
   if (pct < 35) return hsl(yellow);
   const t = Math.min(1, (pct - 35) / (100 - 35)) ** URGENCY_EXP;
   const red = warn().red;
@@ -372,8 +388,11 @@ function applyShadow(shadow) {
   root.setProperty('--shadow-border', `${px.border}px`);
   // Only when asked for explicitly -- otherwise leave the variable unset so
   // the per-theme stylesheet default applies (see SHADOW_DEFAULTS).
-  if (color) root.setProperty('--shadow-color', color);
-  else root.removeProperty('--shadow-color');
+  // The -raw name, not --shadow-color itself: that one is derived from this
+  // by the translucency layer in dashboard.html, and writing it here would
+  // overwrite the derivation with a flat opaque color.
+  if (color) root.setProperty('--shadow-color-raw', color);
+  else root.removeProperty('--shadow-color-raw');
   shadowGrow = px.offset + px.border * 2;
   shadowBorder = px.border;
 }
@@ -392,14 +411,99 @@ function applyTheme(dark) {
   currentWarn = on ? WARN_PALETTES.dark : WARN_PALETTES.light;
 }
 
+// How much of the way to fully opaque each tier claws back from the one
+// opacity number in appearance.json. 0 means "take the opacity as given",
+// 1 means "ignore it, stay solid". The page backdrop is the thing actually
+// being made see-through, so it takes the number at face value; the card
+// faces give up most of it, since a card has to still read as a slab
+// sitting on the wallpaper rather than as a tint of it; and the accent and
+// text tiers give up only a little, because legibility against an
+// arbitrary wallpaper is the one thing translucency mustn't cost. Hence
+// "much slower rate" rather than "not at all" -- at opacity 0.6 the text
+// is still at 0.94, which reads as solid but does pick up a trace of
+// whatever is behind it, so it belongs to the same surface as everything
+// else instead of floating above it.
+const TRANSLUCENCY_TIERS = {
+  page:    0,
+  surface: 0.45,
+  accent:  0.80,
+  text:    0.88,
+};
+
+// Below this, an alpha is close enough to solid that the blending it costs
+// buys nothing visible. It's a guard against a hand-typed 0.999, not a
+// tuning knob.
+const TRANSLUCENCY_EPSILON = 0.002;
+
+// How far toward near-black the section headings and the clock are pulled
+// once the page behind them has gone completely. They're the only text not
+// sitting on a card, so they're the only text that ends up reading against
+// the wallpaper (see --text-faint in dashboard.html). Scaled by how much
+// opacity was actually given up, so at 0.9 it's a nudge and at 0.15 it's
+// most of the way there. Short of 1 on purpose -- a pure black heading
+// against pale text on the cards below looks like a different widget's
+// label pasted on top.
+const HEADING_DARKEN_MAX = 0.7;
+
+// One input, four alphas -- or the whole thing switched off. Off isn't a
+// cosmetic default here: it selects [data-translucent="off"] in
+// dashboard.html, which drops all twelve color-mix() calls out of the
+// token chain, and it's what tells widget.py's transparent window not to
+// be one. So "the flag is false" and "the opacity is 1" both route to it,
+// since a fully opaque translucency is just translucency's cost with none
+// of its effect.
+function applyTranslucency(enabled, opacity) {
+  // Clamped rather than trusted: this is a hand-edited JSON file, and an
+  // opacity of 0 would render an invisible widget with no way to click
+  // anything to fix it (the page is pinned to the desktop layer and takes
+  // no mouse input), so the floor is low enough to be dramatic and high
+  // enough to still find.
+  const raw = Number(opacity ?? 1);
+  const o = Math.min(1, Math.max(0.15, Number.isFinite(raw) ? raw : 1));
+  const on = !!enabled && o < 1 - TRANSLUCENCY_EPSILON;
+
+  document.documentElement.dataset.translucent = on ? 'on' : 'off';
+  const root = document.documentElement.style;
+
+  if (!on) {
+    // Removed, not set to 1: these are inline styles on <html>, so leaving
+    // them behind would beat the stylesheet's own 1s for the rest of the
+    // session and keep a stale value alive across a tray Reload that
+    // turned the flag off.
+    for (const tier of Object.keys(TRANSLUCENCY_TIERS)) {
+      root.removeProperty(`--alpha-${tier}`);
+    }
+    root.removeProperty('--heading-darken');
+    warnAlpha = 1;  // makes hsl() emit its plain three-argument form
+    return;
+  }
+
+  const alpha = frac => o + (1 - o) * frac;
+  for (const [tier, frac] of Object.entries(TRANSLUCENCY_TIERS)) {
+    root.setProperty(`--alpha-${tier}`, alpha(frac));
+  }
+  root.setProperty('--heading-darken', (1 - o) * HEADING_DARKEN_MAX);
+  // The inline-styled warning colors, which no CSS variable reaches.
+  warnAlpha = alpha(TRANSLUCENCY_TIERS.accent);
+}
+
 async function applyAppearance() {
   try {
     const res = await fetch('appearance.json', { cache: 'no-store' });
     if (!res.ok) return;
-    const { accent, scale, spacing, corner_radius, shadow, dark_theme, fetch_interval_minutes, layout } = await res.json();
+    const {
+      accent, scale, spacing, corner_radius, shadow, dark_theme,
+      translucent_background, opacity, fetch_interval_minutes, layout,
+    } = await res.json();
     applyShadow(shadow);
     applyTheme(dark_theme);
-    if (accent) document.documentElement.style.setProperty('--accent', accent);
+    // After applyTheme, which swaps the warning palette this reads the
+    // alpha for -- order doesn't matter for the CSS variables, but warnAlpha
+    // is plain state and may as well be written last.
+    applyTranslucency(translucent_background, opacity);
+    // --accent-raw, not --accent: the latter is derived from it (see the
+    // translucency block in dashboard.html).
+    if (accent) document.documentElement.style.setProperty('--accent-raw', accent);
     if (scale) {
       document.documentElement.style.setProperty('--scale', scale);
       currentScale = scale;

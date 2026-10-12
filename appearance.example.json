@@ -11,6 +11,8 @@
     "bottom": 0
   },
   "dark_theme": false,
+  "translucent_background": false,
+  "opacity": 0.85,
   "shadow": {
     "enabled": false,
     "offset": 10,

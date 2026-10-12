@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import webview
@@ -53,6 +54,58 @@ MAX_HEIGHT = 700
 # This process's serve.py child. Module-level so the tray's 'Restart' can
 # shut it down before spawning the replacement widget -- see restart_now.
 SERVER = None
+
+
+PYTHONW = sys.executable.replace("python.exe", "pythonw.exe")
+
+
+def server_is_up(port):
+    """Whether anything is answering on the port. An HTTP error status still
+    counts -- it means a server replied, which is the question being asked."""
+    try:
+        urllib.request.urlopen(f"http://localhost:{port}/appearance.json", timeout=1)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def start_server(port, attempts=6):
+    """Spawns serve.py and waits until it actually answers, retrying if it
+    exits on startup.
+
+    This replaces a flat one-second sleep, which assumed the spawn always
+    succeeds. It doesn't: serve.py sets allow_reuse_address = False on
+    purpose, so a previous instance's listening socket sitting in TIME_WAIT
+    makes the bind fail outright rather than quietly stacking two servers on
+    one port. The tray's Restart hits that window regularly -- it kills its
+    own server and immediately launches the replacement widget, which is
+    well inside the kernel's TIME_WAIT. The old failure mode was silent and
+    confusing: serve.py died, the sleep expired anyway, and the window came
+    up pointed at a port with nothing behind it, so the widget simply
+    disappeared with no error anywhere.
+
+    Backs off a little further each round, since TIME_WAIT is a wait-it-out
+    problem rather than one that retrying faster solves."""
+    proc = None
+    for attempt in range(attempts):
+        proc = subprocess.Popen([PYTHONW, "serve.py"], cwd=PROJECT_DIR)
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break  # exited -- almost certainly the port; wait and retry
+            if server_is_up(port):
+                return proc
+            time.sleep(0.15)
+        else:
+            # Still running but not answering yet. Hand it over anyway: the
+            # page retries its own fetches, and killing a live server here
+            # would only put us back in the TIME_WAIT hole.
+            return proc
+        time.sleep(0.5 * (attempt + 1))
+    print(f"serve.py would not start after {attempts} attempts (port {port} busy?)")
+    return proc
 
 
 def load_config():
@@ -106,19 +159,85 @@ def apply_rounded_corners(window, radius):
     ctypes.windll.user32.SetWindowRgn(hwnd, hrgn, True)
 
 
+def window_rect(hwnd):
+    rect = ctypes.wintypes.RECT()
+    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    return rect
+
+
+def erase_vacated_area(window, old_rect):
+    """Repaints the desktop over the area the window used to cover.
+
+    Only needed when the window is transparent. An opaque window's own
+    background brush erases whatever it was painting over, and when it
+    shrinks, Windows invalidates the uncovered region of the parent for us
+    -- but a transparent window has no brush to erase with, and because
+    this one is reparented onto WorkerW (the desktop's own paint layer),
+    the thing that would have to redraw underneath is the desktop, which
+    never notices it should. The result is the previous frame's text left
+    stranded outside the window's new, shorter bounds: the widget renders
+    once tall while data is loading, shrinks to fit, and the headings from
+    the taller layout stay on screen as a ghost above it.
+
+    SetWindowRgn doesn't help -- clipping the window stops *it* painting
+    there, which is exactly how the stale pixels end up orphaned rather
+    than overwritten.
+
+    The old rect is in screen coordinates and RedrawWindow wants the
+    parent's client coordinates, which are the same thing for a full-screen
+    desktop window at the origin, but converted properly anyway rather than
+    relying on that."""
+    user32 = ctypes.windll.user32
+    user32.GetParent.restype = ctypes.c_void_p
+    user32.GetParent.argtypes = [ctypes.c_void_p]
+
+    hwnd = ctypes.c_void_p(window.native.Handle.ToInt64())
+    parent = user32.GetParent(hwnd)
+    if not parent:
+        return  # never pinned (survive_show_desktop off) -- DWM handles it
+
+    origin = ctypes.wintypes.POINT(old_rect.left, old_rect.top)
+    user32.ScreenToClient(ctypes.c_void_p(parent), ctypes.byref(origin))
+    stale = ctypes.wintypes.RECT(
+        origin.x,
+        origin.y,
+        origin.x + (old_rect.right - old_rect.left),
+        origin.y + (old_rect.bottom - old_rect.top),
+    )
+
+    RDW_INVALIDATE, RDW_ERASE = 0x0001, 0x0004
+    RDW_ALLCHILDREN, RDW_UPDATENOW = 0x0080, 0x0100
+    user32.RedrawWindow(
+        ctypes.c_void_p(parent),
+        ctypes.byref(stale),
+        None,
+        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+    )
+
+
 class Api:
-    def __init__(self, window, max_height, corner_radius):
+    def __init__(self, window, max_height, corner_radius, translucent=False):
         self._window = window
         self._max_height = max_height
         self._corner_radius = corner_radius
+        self._translucent = translucent
 
     def resize_window(self, width, height):
         # Width has no cap (only height does, as a safety ceiling) -- a
         # scale above 1 is expected to grow the window as wide as it needs.
         width = max(1, int(width))
         height = max(1, min(int(height), self._max_height))
+        # Captured before the resize, because afterwards there's no record of
+        # how much of the desktop this window was covering.
+        stale = (
+            window_rect(ctypes.c_void_p(self._window.native.Handle.ToInt64()))
+            if self._translucent
+            else None
+        )
         self._window.resize(width, height)
         apply_rounded_corners(self._window, self._corner_radius)
+        if stale is not None:
+            erase_vacated_area(self._window, stale)
 
 
 def hide_from_taskbar(window):
@@ -264,10 +383,7 @@ def restart_now(icon, window):
             SERVER.wait(timeout=5)
         except subprocess.TimeoutExpired:
             SERVER.kill()
-    subprocess.Popen(
-        [sys.executable.replace("python.exe", "pythonw.exe"), "widget.py"],
-        cwd=PROJECT_DIR,
-    )
+    subprocess.Popen([PYTHONW, "widget.py"], cwd=PROJECT_DIR)
     window.destroy()
 
 
@@ -307,12 +423,34 @@ def main():
     # values are deliberately the same as --surface-0 in each theme
     # (dashboard.html), so there's no visible seam where one ends.
     page_background = "#1d2128" if appearance.get("dark_theme") else "#f3f4f6"
-
-    SERVER = subprocess.Popen(
-        [sys.executable.replace("python.exe", "pythonw.exe"), "serve.py"],
-        cwd=PROJECT_DIR,
+    # appearance.json's "translucent_background". The page's own rgba colors
+    # can only ever blend against whatever the *window* paints, so without
+    # this flag a translucent card would just reveal page_background above
+    # and nothing else -- the wallpaper is on the other side of the window,
+    # not the other side of the card. transparent=True instead sets
+    # WebView2's DefaultBackgroundColor to Color.Transparent (pywebview's
+    # winforms backend), which makes the control composite with real
+    # per-pixel alpha against what's behind it. Since the window is
+    # reparented onto WorkerW, what's behind it is the desktop wallpaper.
+    #
+    # It also means background_color below is ignored: pywebview's backend
+    # picks one or the other, never both. That's the intended outcome rather
+    # than a loss -- page_background exists to stop a white frame flashing
+    # before the page paints, and a window with no fill has nothing to flash.
+    # An opacity of 1 counts as off, matching applyTranslucency in
+    # dashboard.js -- and this is the half of that check worth having. A
+    # transparent window is composited per-pixel against the desktop for
+    # its whole lifetime, whether or not anything in the page is actually
+    # see-through, so a fully opaque "translucent" widget would pay that
+    # cost continuously to look exactly like the cheap one. The two files
+    # have to agree, or the page would blend into a window that isn't
+    # transparent (grey behind the cards) or vice versa.
+    translucent = (
+        bool(appearance.get("translucent_background"))
+        and float(appearance.get("opacity", 1.0)) < 0.998
     )
-    time.sleep(1)
+
+    SERVER = start_server(port)
 
     window = webview.create_window(
         WINDOW_TITLE,
@@ -329,8 +467,9 @@ def main():
                            # window.x/y instead.
         on_top=False,
         background_color=page_background,
+        transparent=translucent,
     )
-    api = Api(window, MAX_HEIGHT, corner_radius)
+    api = Api(window, MAX_HEIGHT, corner_radius, translucent)
     window.expose(api.resize_window)
 
     window.events.shown += lambda: hide_from_taskbar(window)

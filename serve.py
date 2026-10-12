@@ -79,6 +79,13 @@ def build_appearance():
         # One flag, not a palette: the dark colors live in dashboard.html's
         # [data-theme="dark"] block, so there's nothing per-color to pass.
         "dark_theme": appearance.get("dark_theme", False),
+        # The flag and its one number. Same split as dark_theme: the per-tier
+        # alphas are derived in dashboard.js from this single opacity, so
+        # there's nothing per-element to pass. widget.py reads the flag too,
+        # independently -- it decides whether the OS window itself is
+        # transparent, which no amount of CSS can do from in here.
+        "translucent_background": appearance.get("translucent_background", False),
+        "opacity": appearance.get("opacity", 1.0),
         "fetch_interval_minutes": config.get("fetch_interval_minutes"),
         "layout": appearance.get("layout", {}),
     }).encode("utf-8")

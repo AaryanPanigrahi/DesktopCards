@@ -1,26 +1,34 @@
 <!doctype html>
 <!-- data-shadow starts at "off" to match the 0 lengths the stylesheet
      defaults to, so the markup and the CSS agree before dashboard.js has
-     read appearance.json (or if it can't). data-theme is set there too. -->
-<html lang="en" data-shadow="off">
+     read appearance.json (or if it can't). data-theme is set there too.
+     data-translucent is seeded the same way, and for the same reason: it
+     selects the pass-through token block, which is what the plain :root
+     defaults already amount to. -->
+<html lang="en" data-shadow="off" data-translucent="off">
 <head>
 <meta charset="utf-8">
 <title>Balances</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
+  /* Every color below is a *-raw token, and nothing downstream in this
+     stylesheet uses one directly: the --alpha-* derivation block further
+     down turns each into the var() name the rules actually paint with. That
+     indirection is what makes translucency a token-layer change instead of
+     an edit to all sixty-odd color usages -- see "Translucency" below. */
   :root {
     color-scheme: light;
-    --surface-0:      #f3f4f6;
-    --surface-1:      #ffffff;
-    --surface-2:      #e5e7eb;
-    --text-primary:   #1f2937;
-    --text-secondary: #374151;
-    --text-muted:     #6b7280;
-    --text-faint:     #9ca3af;
-    --ring-track:      #e5e7eb;
-    --error-surface:   #fef2f2;
-    --accent:          #c9b7e8; /* overridden at runtime from appearance.json (Windows accent color); also stands in for the hardcoded green/red in the Uiverse source cards */
-    --error:           #ef4444;
+    --surface-0-raw:      #f3f4f6;
+    --surface-1-raw:      #ffffff;
+    --surface-2-raw:      #e5e7eb;
+    --text-primary-raw:   #1f2937;
+    --text-secondary-raw: #374151;
+    --text-muted-raw:     #6b7280;
+    --text-faint-raw:     #9ca3af;
+    --ring-track-raw:      #e5e7eb;
+    --error-surface-raw:   #fef2f2;
+    --accent-raw:          #c9b7e8; /* overridden at runtime from appearance.json (Windows accent color); also stands in for the hardcoded green/red in the Uiverse source cards */
+    --error-raw:           #ef4444;
     --scale:           1; /* overridden at runtime from appearance.json */
     --corner-radius:   20px; /* overridden at runtime from appearance.json */
 
@@ -59,7 +67,7 @@
        would only have gotten the shadow clipped off. */
     --shadow-offset:   0px;
     --shadow-border:   0px;
-    --shadow-color:    #323232;
+    --shadow-color-raw: #323232;
     --shadow-grow:     calc(var(--shadow-offset) + var(--shadow-border) * 2);
   }
 
@@ -87,16 +95,16 @@
      form UI WebView2 draws come out dark instead of a light strip. */
   :root[data-theme="dark"] {
     color-scheme: dark;
-    --surface-0:      #1d2128;
-    --surface-1:      #292e37;
-    --surface-2:      #3e4651;
-    --text-primary:   #f2f4f7;
-    --text-secondary: #d5dbe3;
-    --text-muted:     #a2abb8;
-    --text-faint:     #7a8391;
-    --ring-track:     #3e4651;
-    --error:          #fa8585;
-    --error-surface:  #43282d;
+    --surface-0-raw:      #1d2128;
+    --surface-1-raw:      #292e37;
+    --surface-2-raw:      #3e4651;
+    --text-primary-raw:   #f2f4f7;
+    --text-secondary-raw: #d5dbe3;
+    --text-muted-raw:     #a2abb8;
+    --text-faint-raw:     #7a8391;
+    --ring-track-raw:     #3e4651;
+    --error-raw:          #fa8585;
+    --error-surface-raw:  #43282d;
     /* Dark, which only works because the surfaces above are mid-greys
        rather than near-black: this shadow has no blur, so it's a drawn
        edge and needs contrast to exist at all, and against a #1d2128 page
@@ -106,7 +114,7 @@
        than the page rather than equal to it, so the slab stays visible
        where it falls outside the card. appearance.json's shadow.color
        still overrides this. */
-    --shadow-color:   #101318;
+    --shadow-color-raw: #101318;
   }
 
   /* Shadow off, dark theme: a slightly darker card. With the shadow on,
@@ -119,7 +127,112 @@
      the whole widget. Only the dark theme needs this: on white, a card
      without a border reads as paper, which is the point. */
   :root[data-theme="dark"][data-shadow="off"] {
-    --surface-1: #23272f;
+    --surface-1-raw: #23272f;
+  }
+
+  /* Translucency (appearance.json "translucent_background" + "opacity").
+     dashboard.js writes the four --alpha-* numbers; everything here just
+     applies them. All four default to 1, which makes every color-mix below
+     resolve to exactly its own raw token -- so with translucency off this
+     whole layer is a no-op and the stylesheet paints the same colors it
+     did before it existed.
+
+     Four tiers, not one, because a single alpha applied uniformly reads as
+     a faded screenshot rather than a translucent panel: the page backdrop
+     takes the opacity you asked for in full, card faces take most of it,
+     and the accent/bar and text tiers give up only a fraction of theirs so
+     they stay legible sitting on top of the wallpaper. The per-tier
+     fractions live in dashboard.js (TRANSLUCENCY_TIERS), not here, since
+     they're arithmetic on one input rather than styling.
+
+     color-mix against `transparent` is the mechanism: it takes a color of
+     any format (these are hex, and --accent-raw is whatever
+     appearance.json hands us) and returns it at a fraction of its alpha,
+     without needing the tokens broken into r/g/b components. Resolution
+     happens at use time, so this block sitting in plain :root still picks
+     up the dark theme's raw values when [data-theme="dark"] is active --
+     cascade order between the two blocks is irrelevant, they set different
+     properties. */
+  :root {
+    --alpha-page:    1;
+    --alpha-surface: 1;
+    --alpha-accent:  1;
+    --alpha-text:    1;
+    --heading-darken: 0;
+
+    --surface-0:      color-mix(in srgb, var(--surface-0-raw)      calc(var(--alpha-page) * 100%),    transparent);
+    --surface-1:      color-mix(in srgb, var(--surface-1-raw)      calc(var(--alpha-surface) * 100%), transparent);
+    --surface-2:      color-mix(in srgb, var(--surface-2-raw)      calc(var(--alpha-surface) * 100%), transparent);
+    --error-surface:  color-mix(in srgb, var(--error-surface-raw)  calc(var(--alpha-surface) * 100%), transparent);
+    /* The shadow follows the card rather than the page: it's a drawn edge
+       belonging to the card it's cast by, and at page alpha it washed out
+       into the wallpaper while the card above it still read as solid. */
+    --shadow-color:   color-mix(in srgb, var(--shadow-color-raw)   calc(var(--alpha-surface) * 100%), transparent);
+    /* The bar's track is on the accent tier, not the surface one, so the
+       whole progress bar -- track and fill together -- fades as a single
+       object instead of its background dropping out from under it. */
+    --ring-track:     color-mix(in srgb, var(--ring-track-raw)     calc(var(--alpha-accent) * 100%),  transparent);
+    --accent:         color-mix(in srgb, var(--accent-raw)         calc(var(--alpha-accent) * 100%),  transparent);
+    --text-primary:   color-mix(in srgb, var(--text-primary-raw)   calc(var(--alpha-text) * 100%),    transparent);
+    --text-secondary: color-mix(in srgb, var(--text-secondary-raw) calc(var(--alpha-text) * 100%),    transparent);
+    --text-muted:     color-mix(in srgb, var(--text-muted-raw)     calc(var(--alpha-text) * 100%),    transparent);
+    /* The section headings and the "updated" clock, and only those -- they
+       are the one thing in the widget that sits on the page backdrop
+       rather than on a card, so they're the only text whose background is
+       the wallpaper itself at the full page alpha. A faint grey that reads
+       as a quiet label against a solid page turns into unreadable haze
+       over an arbitrary photo. So as the opacity falls they're pulled
+       toward near-black, by --heading-darken (dashboard.js), which is 0 at
+       full opacity and grows as the page disappears. Darkening rather than
+       just solidifying because the problem isn't that they're faint, it's
+       that they're mid-grey against an unknown and usually brighter
+       surface. Both themes get this: in the dark theme the page is barely
+       there at low opacity either way, so the heading's real backdrop is
+       the wallpaper in both cases.
+
+       Two nested mixes, applied in that order: darken first, then take the
+       text tier's alpha, so the darkening doesn't get diluted by it. */
+    --text-faint-shaded: color-mix(in srgb, #0b0e13 calc(var(--heading-darken) * 100%), var(--text-faint-raw));
+    --text-faint:     color-mix(in srgb, var(--text-faint-shaded) calc(var(--alpha-text) * 100%),    transparent);
+    --error:          color-mix(in srgb, var(--error-raw)          calc(var(--alpha-text) * 100%),    transparent);
+  }
+
+  /* Translucency off: the tokens go straight through, with no color-mix in
+     the chain at all. Functionally this is identical to the block above
+     with all four alphas at 1 -- that's deliberate, it's what makes the
+     feature safe to leave on by default -- but it is not identical in
+     cost. Every one of those twelve color-mix() calls is real work the
+     style engine does on each recalc, and a color-mix result carries an
+     alpha channel even when that alpha is 1.000, which keeps the card and
+     page backgrounds on the compositor's blended path instead of letting
+     it treat them as opaque fills it can draw over. Higher specificity
+     than the plain :root above, so this simply wins when the attribute is
+     "off".
+
+     dashboard.js sets the attribute off for either of two reasons: the
+     flag is false, or the opacity is 1 (asking for translucency and then
+     asking for none of it). The alphas are still pinned at 1 here because
+     .card-logo reads one as an element opacity, and opacity: 1 is the
+     value browsers special-case into costing nothing. */
+  :root[data-translucent="off"] {
+    --alpha-page:    1;
+    --alpha-surface: 1;
+    --alpha-accent:  1;
+    --alpha-text:    1;
+    --heading-darken: 0;
+
+    --surface-0:      var(--surface-0-raw);
+    --surface-1:      var(--surface-1-raw);
+    --surface-2:      var(--surface-2-raw);
+    --error-surface:  var(--error-surface-raw);
+    --shadow-color:   var(--shadow-color-raw);
+    --ring-track:     var(--ring-track-raw);
+    --accent:         var(--accent-raw);
+    --text-primary:   var(--text-primary-raw);
+    --text-secondary: var(--text-secondary-raw);
+    --text-muted:     var(--text-muted-raw);
+    --text-faint:     var(--text-faint-raw);
+    --error:          var(--error-raw);
   }
 
   * { box-sizing: border-box; }
@@ -259,9 +372,16 @@
   .debit-row-full .card { flex: 1 1 auto; }
   .card-grid .balance { margin: 0.6rem 0 0; font-size: 1.75rem; line-height: 1.95rem; }
 
+  /* The one painted thing that isn't a color token -- an <img> of the
+     institution's logo -- so it takes the accent tier's alpha as an
+     element opacity instead. Without this it stays fully opaque while
+     everything around it fades, and the logos end up the only solid
+     objects on the card. Same tier as the accent so it tracks the bars and
+     the card number, which is the company's own color showing up twice. */
   .card-logo {
     width: 1.5rem; height: 1.5rem; border-radius: 9999px; flex-shrink: 0;
     object-fit: cover; background: var(--surface-2);
+    opacity: var(--alpha-accent);
   }
 
   .card-logo-fallback {
