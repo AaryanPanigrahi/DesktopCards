@@ -20,10 +20,13 @@ import subprocess
 import sys
 
 import make_icon
-from paths import ASSET_DIR
+from paths import ASSET_DIR, DIST_DIR, REPO_ROOT
 
+# The spec sits with the code it builds; the output belongs at the top of
+# the checkout, next to logo.png, because dist/ is the app rather than part
+# of the source.
 SPEC = os.path.join(ASSET_DIR, "DesktopCards.spec")
-DIST = os.path.join(ASSET_DIR, "dist")
+DIST = DIST_DIR
 EXE = os.path.join(DIST, "DesktopCards.exe")
 SETUP_EXE = os.path.join(DIST, "DesktopCards-Setup.exe")
 
@@ -68,9 +71,12 @@ def main():
     make_icon.main()
 
     print("\n2/3  PyInstaller")
+    # Run from the repo root so PyInstaller's dist/ and build/ land there
+    # rather than inside source/. The spec resolves its own inputs from
+    # SPECPATH, so it doesn't care where it's invoked from.
     result = subprocess.run(
         [sys.executable, "-m", "PyInstaller", SPEC, "--noconfirm", "--clean"],
-        cwd=ASSET_DIR,
+        cwd=REPO_ROOT,
     )
     if result.returncode != 0:
         sys.exit(f"PyInstaller failed (exit {result.returncode}).")

@@ -42,8 +42,9 @@ import threading
 import time
 
 import fetch_data
+import net_guard
 
-from paths import APPEARANCE_PATH, ASSET_DIR, CONFIG_PATH, DATA_DIR
+from paths import APPEARANCE_PATH, ASSET_DIR, CONFIG_PATH, DATA_DIR, LOOPBACK
 
 def read_port():
     """The port, or the default if config.json isn't readable yet.
@@ -144,7 +145,32 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return os.path.join(DATA_DIR, *rel.split("/"))
         return full
 
+    def local_only(self):
+        """403s anything that isn't this machine's own browser.
+
+        Binding to loopback keeps this server off the network; this is the
+        other half, against a page in the local browser reaching in by DNS
+        rebinding or cross-site POST. See net_guard."""
+        reason = net_guard.rejection(
+            # The server's real port, not the module-level PORT: build_server
+            # can be handed a different one.
+            self.server.server_address[1],
+            method=self.command,
+            host=self.headers.get("Host"),
+            origin=self.headers.get("Origin"),
+            fetch_site=self.headers.get("Sec-Fetch-Site"),
+            fetch_mode=self.headers.get("Sec-Fetch-Mode"),
+        )
+        if reason is None:
+            return True
+        print(f"[serve] refused {self.command} {self.path}: {reason}")
+        self.send_error(403, "Forbidden")
+        return False
+
     def do_GET(self):
+        if not self.local_only():
+            return
+
         if self.path == "/":
             self.path = "/dashboard.html"
 
@@ -173,6 +199,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
+        if not self.local_only():
+            return
         if self.path == "/restart":
             self.handle_restart()
             return
@@ -262,13 +290,13 @@ def build_server(port=None, attempts=12, delay=0.5):
     last = None
     for attempt in range(attempts):
         try:
-            return Server(("localhost", port), Handler)
+            return Server((LOOPBACK, port), Handler)
         except OSError as e:
             last = e
             if attempt + 1 < attempts:
                 time.sleep(delay)
     raise OSError(
-        f"could not bind localhost:{port} after {attempts} attempts "
+        f"could not bind {LOOPBACK}:{port} after {attempts} attempts "
         f"({last}). Another process may be using it."
     )
 
@@ -289,7 +317,7 @@ def serve_in_thread(port=None):
 
 def main():
     with build_server() as httpd:
-        print(f"Serving {ASSET_DIR} at http://localhost:{PORT}")
+        print(f"Serving {ASSET_DIR} at http://{LOOPBACK}:{PORT}")
         httpd.serve_forever()
 
 

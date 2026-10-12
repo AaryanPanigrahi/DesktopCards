@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import urllib.request
+import webbrowser
 
 import webview
 from PIL import Image, ImageDraw
@@ -42,6 +43,8 @@ from paths import (
     DATA_PATH,
     DETACHED,
     FROZEN,
+    LOOPBACK,
+    SETUP_PORT,
     clean_child_env,
     APPEARANCE_PATH,
     APPEARANCE_SNAPSHOT_PATH,
@@ -216,7 +219,7 @@ def refresh_now(port, window):
     disruptive operation than this quick action should trigger; use
     'Restart' (a full process relaunch) for changes that need that."""
     try:
-        req = urllib.request.Request(f"http://localhost:{port}/refresh", method="POST")
+        req = urllib.request.Request(f"http://{LOOPBACK}:{port}/refresh", method="POST")
         urllib.request.urlopen(req, timeout=30)
     except Exception as e:
         print(f"Reload failed: {e}")
@@ -352,8 +355,24 @@ def make_tray_icon(port, window, appearance):
 
         This is the everyday route for adding a bank. The setup exe can
         do it too, but nobody should have to go find a file in Downloads
-        to add a card."""
-        spawn_self("--setup")
+        to add a card.
+
+        Reuses a setup server that's already up rather than starting a
+        second one. Every click used to spawn a process, and Werkzeug
+        allows address reuse, so they stacked on one port instead of
+        failing: requests were then split between them at random and a
+        reload could land on an older copy of the page. Setup now exits
+        when its tab closes, so this is about the window where two clicks
+        happen while one tab is open."""
+        url = f"http://{LOOPBACK}:{SETUP_PORT}"
+        try:
+            urllib.request.urlopen(f"{url}/api/state", timeout=1)
+        except Exception:
+            spawn_self("--setup")
+        else:
+            # Already running, so just bring its page back up. A browser
+            # focuses the existing tab for a URL it already has open.
+            webbrowser.open(url)
 
     def on_quit(icon, item):
         icon.stop()
@@ -365,7 +384,7 @@ def make_tray_icon(port, window, appearance):
 
     menu = pystray.Menu(
         pystray.MenuItem("Reload", on_reload),
-        pystray.MenuItem("Modify Accounts", on_modify_accounts),
+        pystray.MenuItem("Modify", on_modify_accounts),
         pystray.MenuItem("Restart", on_restart),
         pystray.MenuItem("Quit", on_quit),
     )
@@ -438,7 +457,7 @@ def main():
 
     window = webview.create_window(
         WINDOW_TITLE,
-        url=f"http://localhost:{port}/{PAGE}",
+        url=f"http://{LOOPBACK}:{port}/{PAGE}",
         width=WINDOW_WIDTH,
         height=MAX_HEIGHT,
         x=win.get("x", 100),

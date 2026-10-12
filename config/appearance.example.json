@@ -10,7 +10,7 @@
     "right": 0,
     "bottom": 0
   },
-  "dark_theme": false,
+  "dark_theme": true,
   "translucent_background": false,
   "opacity": 0.95,
   "shadow": {
@@ -29,12 +29,14 @@
     "depository": {
       "title": "Checking & Savings",
       "order": [],
+      "hidden": [],
       "new_row_digit_threshold": 6,
       "new_row_name_length_threshold": 12
     },
     "credit": {
       "title": "Credit Cards",
-      "order": []
+      "order": [],
+      "hidden": []
     }
   }
 }

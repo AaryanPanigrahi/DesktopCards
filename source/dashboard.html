@@ -1,11 +1,17 @@
 <!doctype html>
 <!-- data-shadow starts at "off" to match the 0 lengths the stylesheet
      defaults to, so the markup and the CSS agree before dashboard.js has
-     read appearance.json (or if it can't). data-theme is set there too.
-     data-translucent is seeded the same way, and for the same reason: it
-     selects the pass-through token block, which is what the plain :root
-     defaults already amount to. -->
-<html lang="en" data-shadow="off" data-translucent="off">
+     read appearance.json (or if it can't). data-translucent is seeded the
+     same way, and for the same reason: it selects the pass-through token
+     block, which is what the plain :root defaults already amount to.
+
+     data-theme is seeded to dark because that's the shipped default
+     (appearance.example.json). The stylesheet's own :root is the light
+     palette, so without this the window painted light for the moment
+     before dashboard.js read appearance.json and corrected it -- a flash
+     on every launch. dashboard.js still owns the attribute after that and
+     will set it to "light" if that's what the file says. -->
+<html lang="en" data-theme="dark" data-shadow="off" data-translucent="off">
 <head>
 <meta charset="utf-8">
 <title>Balances</title>

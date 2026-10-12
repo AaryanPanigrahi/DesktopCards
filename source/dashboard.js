@@ -593,11 +593,25 @@ async function load() {
     }
 
     const cardsEl = document.getElementById('cards');
-    const accounts = data.accounts || [];
+    const fetched = data.accounts || [];
     const errors = data.errors || [];
 
+    // Accounts switched off in the Modify page's Accounts tab. Dropped here,
+    // before anything measures or lays out, so a hidden card can't widen the
+    // window to make room for something that never gets drawn.
+    const hidden = new Set();
+    for (const type of SECTION_TYPES) {
+      for (const key of (layout[type] || {}).hidden || []) hidden.add(key);
+    }
+    const accounts = fetched.filter(a => !hidden.has(orderKey(a)));
+
     if (accounts.length === 0 && errors.length === 0) {
-      cardsEl.innerHTML = '<div class="empty">No accounts yet. Run plaid_link_setup.py to link a bank, then fetch_data.py.</div>';
+      // Told apart on purpose: "nothing linked yet" and "you've hidden all
+      // of it" look identical on screen and have completely different fixes.
+      cardsEl.innerHTML = fetched.length
+        ? '<div class="empty">Every account is hidden. Tray icon &rarr; Modify &rarr; Accounts to show one again.</div>'
+        : '<div class="empty">No accounts yet. Run plaid_link_setup.py to link a bank, then fetch_data.py.</div>';
+      fitWindowToContent();
       return;
     }
 

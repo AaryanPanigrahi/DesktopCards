@@ -1,22 +1,38 @@
-config.json
-appearance.json
-data.json
-cache/
+# Your data. All of it lives in config/ from source, which is the same
+# folder the committed *.example.json templates sit in -- the examples are
+# tracked, everything they get copied into is not.
+config/config.json
+config/appearance.json
+config/data.json
+config/cache/
+
+# Runtime log. Written whenever there's no console to print to, which
+# includes a source run under pythonw -- and from source, DATA_DIR is
+# config/.
+config/desktopcards.log
+
 __pycache__/
 *.pyc
 .venv/
 venv/
 .claude/
-exe_problems.md
 
 # Build output. The spec and build scripts are committed; what they
 # produce isn't. DesktopCards.ico is generated from logo.png on every
-# build, so it's output too.
+# build, so it's output too. dist/ and build/ land at the repo root
+# because the build runs from there.
 build/
 dist/
 DesktopCards.ico
 
-# Runtime log. Written whenever there's no console to print to, which
-# includes a source run under pythonw -- and from source, DATA_DIR is
-# this folder.
-desktopcards.log
+# The packaged app: a copy of the built setup exe, and the zip of it. Built
+# locally and uploaded to Releases, which is where people download it from,
+# so a 30MB binary has no business sitting in every clone of the repo.
+DesktopCards_Install
+DesktopCards_Install.zip
+
+# An unused alternate mark.
+logo2.png
+
+# Working notes, not documentation.
+Docs/exe_problems.md

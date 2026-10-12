@@ -15,9 +15,7 @@ import os
 import sys
 
 from logo_cache import write_ico
-from paths import ASSET_DIR, logo_path
-
-ICON_PATH = os.path.join(ASSET_DIR, "DesktopCards.ico")
+from paths import ICON_PATH, logo_path
 
 
 def main():

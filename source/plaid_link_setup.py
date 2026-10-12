@@ -28,7 +28,8 @@ from plaid.model.item_public_token_exchange_request import (
 )
 from plaid.model.institutions_get_by_id_request import InstitutionsGetByIdRequest
 
-from paths import CONFIG_PATH
+import net_guard
+from paths import CONFIG_PATH, LOOPBACK
 
 LINK_PORT = 8008
 
@@ -116,6 +117,26 @@ def add_item(client, config, public_token, institution_name, institution_id):
 # the helpers above costs nothing and can't exit the process.
 app = Flask(__name__)
 shutdown_event = threading.Event()
+
+
+@app.before_request
+def only_this_machine():
+    """Same guard the other two servers use. See net_guard.
+
+    This form is the most sensitive one in the app -- it exchanges a public
+    token for an access token -- so it gets the same treatment as the
+    dashboard rather than relying on loopback alone."""
+    reason = net_guard.rejection(
+        LINK_PORT,
+        method=request.method,
+        host=request.host,
+        origin=request.headers.get("Origin"),
+        fetch_site=request.headers.get("Sec-Fetch-Site"),
+        fetch_mode=request.headers.get("Sec-Fetch-Mode"),
+    )
+    if reason:
+        print(f"[link] refused {request.method} {request.path}: {reason}")
+        return jsonify(ok=False, error="Refused: not a local request."), 403
 
 PAGE = """
 <!doctype html>
@@ -215,10 +236,14 @@ def watch_for_shutdown():
 
 def main():
     threading.Thread(target=watch_for_shutdown, daemon=True).start()
-    url = f"http://localhost:{LINK_PORT}"
+    url = f"http://{LOOPBACK}:{LINK_PORT}"
     print(f"Opening {url} in your browser to link a bank account...")
     threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    app.run(port=LINK_PORT)
+    # Explicit, though it is also Flask's default: this form carries a Plaid
+    # secret and an access token, and "it happens to default to loopback"
+    # is not something that should be left implicit in the one file where
+    # being wrong would publish bank credentials to the network.
+    app.run(host=LOOPBACK, port=LINK_PORT)
 
 
 if __name__ == "__main__":
