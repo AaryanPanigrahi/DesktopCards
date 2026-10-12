@@ -349,10 +349,11 @@ function applyOrder(accounts, orderKeys) {
 let fetchIntervalMinutes = null;
 let currentLayout = DEFAULT_LAYOUT;
 
-// The hard offset shadow from newUI/short_css.txt, off unless
-// appearance.json asks for it. Defaults match that reference exactly
-// (10px offset, 3px border, #323232) so "enabled": true alone gives the
-// look it was taken from, with each piece still overridable.
+// The hard offset shadow, off unless appearance.json asks for it.
+// Defaults match the original reference exactly -- a CSS sample by
+// micaelgomestavares on Uiverse.io -- at 10px offset, 3px border,
+// #323232, so "enabled": true alone gives the look it was taken from,
+// with each piece still overridable.
 // No default color here on purpose: the stylesheet owns that, because it's
 // the one piece of the shadow that has to differ per theme (#323232 on
 // light, near-black on dark -- see :root[data-theme="dark"] in

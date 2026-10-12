@@ -52,8 +52,10 @@
        strip of page showing at its right end. */
     --debit-base:      calc((var(--content-width) + var(--shadow-border) * 2 - var(--card-gap)) / 2);
 
-    /* Neo-brutalist hard shadow + matching border, from
-       newUI/short_css.txt (appearance.json "shadow"). Both lengths default
+    /* Neo-brutalist hard shadow + matching border (appearance.json
+       "shadow"), taken from a CSS sample by micaelgomestavares on
+       Uiverse.io: box-shadow: 10px 10px #323232 with a matching
+       3px solid border. Both lengths default
        to 0 so the effect is simply absent unless it's switched on -- a
        0 0 hard shadow paints exactly behind the opaque card where nothing
        can see it, and a 0px border draws nothing -- which keeps this to

@@ -10,27 +10,18 @@ import json
 import os
 import sys
 
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-APPEARANCE_PATH = os.path.join(PROJECT_DIR, "appearance.json")
-
-
-def read_accent():
-    import winreg
-
-    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM")
-    value, _ = winreg.QueryValueEx(key, "ColorizationColor")
-    # Stored as 0xAARRGGBB
-    r = (value >> 16) & 0xFF
-    g = (value >> 8) & 0xFF
-    b = value & 0xFF
-    return f"#{r:02x}{g:02x}{b:02x}"
+from paths import APPEARANCE_PATH
 
 
 def main():
     if sys.platform != "win32":
         sys.exit("accent_color.py only works on Windows.")
 
-    accent = read_accent()
+    # The registry read itself lives in platform_win.py, with the rest of the
+    # OS-specific calls, so a port has one file to replace rather than two.
+    import platform_win
+
+    accent = platform_win.system_accent()
 
     appearance = {}
     if os.path.exists(APPEARANCE_PATH):

@@ -20,6 +20,7 @@ import datetime
 import json
 import os
 import sys
+import threading
 import urllib.request
 
 import plaid
@@ -34,11 +35,13 @@ from plaid.model.item_get_request import ItemGetRequest
 from plaid.model.country_code import CountryCode
 from plaid.exceptions import ApiException
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
-DATA_PATH = os.path.join(os.path.dirname(__file__), "data.json")
-CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
-LOGOS_DIR = os.path.join(CACHE_DIR, "logos")
-CONFIG_SNAPSHOT_PATH = os.path.join(CACHE_DIR, "config_snapshot.json")
+from paths import (
+    CACHE_DIR,
+    CONFIG_PATH,
+    CONFIG_SNAPSHOT_PATH,
+    DATA_PATH,
+    LOGOS_DIR,
+)
 
 ENV_MAP = {
     "sandbox": plaid.Environment.Sandbox,
@@ -263,7 +266,21 @@ def process_item(client, item, force_logo_refresh=False):
         return [], error, False
 
 
+# Serializes main(). There are two callers inside the widget process now --
+# the tray's Reload (via the server's /refresh) and the interval timer that
+# replaced the Task Scheduler job -- and they can land at the same moment.
+# Both end by rewriting config.json and data.json wholesale, so overlapping
+# runs could interleave those writes, and the loser's fetch would be wasted
+# work anyway. Not reentrant: nothing calls main() from inside main().
+_fetch_lock = threading.Lock()
+
+
 def main():
+    with _fetch_lock:
+        return _main()
+
+
+def _main():
     config = load_config()
     client = build_client(config)
     items = config.get("items", [])

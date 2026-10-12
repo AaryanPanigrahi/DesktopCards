@@ -4,10 +4,16 @@ pywebview (Windows' built-in WebView2 engine) instead of a Chrome --app
 window -- Chrome paints its own minimal titlebar on --app windows
 regardless of native window styles, so it can't be made truly frameless.
 
-Starts serve.py as a background subprocess, opens the frameless webview
+Hosts the HTTP server on a daemon thread, opens the frameless webview
 window pinned to the configured position/size, exposes a resize API the
-page calls to self-fit its height, and (optionally) reparents the window
-onto the desktop's own WorkerW layer so it survives Win+D.
+page calls to self-fit its height, runs the interval Plaid fetch, and
+(optionally) reparents the window onto the desktop's own WorkerW layer so
+it survives Win+D.
+
+Not the entry point -- desktopcards.py is. The server and the fetch both
+live in this process now rather than as separate ones, so there's a single
+process to launch, a single one to kill, and nothing that can outlive the
+widget holding its port.
 
 That WorkerW layer doesn't receive normal mouse input (the same reason
 Rainmeter/Wallpaper Engine skins need a system-wide hook to be clickable),
@@ -16,26 +22,37 @@ pinned. Manual refresh/quit instead live in a system tray icon, which is
 a normal interactive window regardless of where the main widget is parented.
 """
 
-import ctypes
-import ctypes.wintypes
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 
 import webview
 from PIL import Image, ImageDraw
 import pystray
 
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(PROJECT_DIR, "config.json")
-APPEARANCE_PATH = os.path.join(PROJECT_DIR, "appearance.json")
-CACHE_DIR = os.path.join(PROJECT_DIR, "cache")
-APPEARANCE_SNAPSHOT_PATH = os.path.join(CACHE_DIR, "appearance_snapshot.json")
+import fetch_data
+import logo_cache
+import platform_win as native
+import serve
+from paths import (
+    DATA_PATH,
+    DETACHED,
+    FROZEN,
+    clean_child_env,
+    APPEARANCE_PATH,
+    APPEARANCE_SNAPSHOT_PATH,
+    ASSET_DIR,
+    CACHE_DIR,
+    CONFIG_PATH,
+)
+
+# The folder the sibling scripts are spawned from. That's the asset side, not
+# the data side: it's where serve.py and widget.py themselves live.
+PROJECT_DIR = ASSET_DIR
 
 WINDOW_TITLE = "Balances"
 PAGE = "dashboard.html"
@@ -51,61 +68,56 @@ PAGE = "dashboard.html"
 WINDOW_WIDTH = 325
 MAX_HEIGHT = 700
 
-# This process's serve.py child. Module-level so the tray's 'Restart' can
-# shut it down before spawning the replacement widget -- see restart_now.
-SERVER = None
+def force_exit_soon(delay=2.5):
+    """A watchdog that ends this process if a clean shutdown doesn't.
+
+    window.destroy() is supposed to end webview.start() and let main()
+    return, and from source it does. Frozen it reliably leaves the
+    process alive with its window handle still registered -- pywebview's
+    WinForms/pythonnet loop doesn't fully unwind -- and every such
+    leftover pins a ~35MB onefile unpack directory that its bootloader
+    can't clean up. Three restarts, three orphans.
+
+    So the clean path gets a head start and this is the backstop. Nothing
+    is lost by it: config.json and data.json are written synchronously
+    and complete long before here, the tray is already stopped, and the
+    replacement process waits out the port on its own. os._exit rather
+    than sys.exit because the point is to skip an interpreter shutdown
+    that is demonstrably capable of hanging."""
+    def bail():
+        print("[exit] clean shutdown did not finish; exiting.")
+        os._exit(0)
+
+    t = threading.Timer(delay, bail)
+    t.daemon = True
+    t.start()
 
 
-PYTHONW = sys.executable.replace("python.exe", "pythonw.exe")
+def spawn_self(*args):
+    """Starts another copy of this app, with optional subcommand flags.
 
-
-def server_is_up(port):
-    """Whether anything is answering on the port. An HTTP error status still
-    counts -- it means a server replied, which is the question being asked."""
-    try:
-        urllib.request.urlopen(f"http://localhost:{port}/appearance.json", timeout=1)
-        return True
-    except urllib.error.HTTPError:
-        return True
-    except Exception:
-        return False
-
-
-def start_server(port, attempts=6):
-    """Spawns serve.py and waits until it actually answers, retrying if it
-    exits on startup.
-
-    This replaces a flat one-second sleep, which assumed the spawn always
-    succeeds. It doesn't: serve.py sets allow_reuse_address = False on
-    purpose, so a previous instance's listening socket sitting in TIME_WAIT
-    makes the bind fail outright rather than quietly stacking two servers on
-    one port. The tray's Restart hits that window regularly -- it kills its
-    own server and immediately launches the replacement widget, which is
-    well inside the kernel's TIME_WAIT. The old failure mode was silent and
-    confusing: serve.py died, the sleep expired anyway, and the window came
-    up pointed at a port with nothing behind it, so the widget simply
-    disappeared with no error anywhere.
-
-    Backs off a little further each round, since TIME_WAIT is a wait-it-out
-    problem rather than one that retrying faster solves."""
-    proc = None
-    for attempt in range(attempts):
-        proc = subprocess.Popen([PYTHONW, "serve.py"], cwd=PROJECT_DIR)
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                break  # exited -- almost certainly the port; wait and retry
-            if server_is_up(port):
-                return proc
-            time.sleep(0.15)
-        else:
-            # Still running but not answering yet. Hand it over anyway: the
-            # page retries its own fetches, and killing a live server here
-            # would only put us back in the TIME_WAIT hole.
-            return proc
-        time.sleep(0.5 * (attempt + 1))
-    print(f"serve.py would not start after {attempts} attempts (port {port} busy?)")
-    return proc
+    Frozen, sys.executable *is* the app and takes no script argument.
+    From source it's the interpreter and needs one -- and specifically
+    needs pythonw.exe, or the new process gets a console window this one
+    didn't have."""
+    if FROZEN:
+        cmd = [sys.executable, *args]
+        # NOT PROJECT_DIR. Frozen, that's ASSET_DIR, which is this
+        # process's own _MEIPASS unpack directory -- and a process's
+        # current directory is locked against deletion for as long as it
+        # lives. Starting the replacement there means our bootloader can
+        # never remove its temp folder when we exit, so it lingers
+        # forever trying: one orphaned process and one undeletable ~35MB
+        # directory per restart. The exe's own folder is stable and
+        # outlives everybody.
+        cwd = os.path.dirname(sys.executable)
+    else:
+        pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+        cmd = [pythonw, "desktopcards.py", *args]
+        cwd = PROJECT_DIR  # where desktopcards.py actually is
+    return subprocess.Popen(
+        cmd, cwd=cwd, env=clean_child_env(), **DETACHED
+    )
 
 
 def load_config():
@@ -134,87 +146,6 @@ def save_appearance_snapshot(appearance):
         json.dump(appearance, f, indent=2)
 
 
-def apply_rounded_corners(window, radius):
-    """Clips the actual OS window to a rounded-rect region via
-    SetWindowRgn -- the area outside it simply isn't painted, so whatever
-    is behind the window (desktop or another window) shows through there.
-    This is the real way to get a non-rectangular window shape on Win32;
-    pywebview's transparent=True only makes WebView2's own background
-    transparent against the Form's paint, not the window's actual shape,
-    so it doesn't give rounded corners by itself.
-
-    Reads the window's actual client rect in device pixels rather than
-    trusting our own WINDOW_WIDTH/resize-height values -- those are CSS
-    pixels, and at any display scaling above 100% the real window is
-    physically larger, so a region built from the CSS numbers clipped off
-    a real slice of the right/bottom edge."""
-    if radius <= 0:
-        return
-    hwnd = ctypes.c_void_p(window.native.Handle.ToInt64())
-    rect = ctypes.wintypes.RECT()
-    ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
-    width = rect.right - rect.left
-    height = rect.bottom - rect.top
-    hrgn = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius)
-    ctypes.windll.user32.SetWindowRgn(hwnd, hrgn, True)
-
-
-def window_rect(hwnd):
-    rect = ctypes.wintypes.RECT()
-    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
-    return rect
-
-
-def erase_vacated_area(window, old_rect):
-    """Repaints the desktop over the area the window used to cover.
-
-    Only needed when the window is transparent. An opaque window's own
-    background brush erases whatever it was painting over, and when it
-    shrinks, Windows invalidates the uncovered region of the parent for us
-    -- but a transparent window has no brush to erase with, and because
-    this one is reparented onto WorkerW (the desktop's own paint layer),
-    the thing that would have to redraw underneath is the desktop, which
-    never notices it should. The result is the previous frame's text left
-    stranded outside the window's new, shorter bounds: the widget renders
-    once tall while data is loading, shrinks to fit, and the headings from
-    the taller layout stay on screen as a ghost above it.
-
-    SetWindowRgn doesn't help -- clipping the window stops *it* painting
-    there, which is exactly how the stale pixels end up orphaned rather
-    than overwritten.
-
-    The old rect is in screen coordinates and RedrawWindow wants the
-    parent's client coordinates, which are the same thing for a full-screen
-    desktop window at the origin, but converted properly anyway rather than
-    relying on that."""
-    user32 = ctypes.windll.user32
-    user32.GetParent.restype = ctypes.c_void_p
-    user32.GetParent.argtypes = [ctypes.c_void_p]
-
-    hwnd = ctypes.c_void_p(window.native.Handle.ToInt64())
-    parent = user32.GetParent(hwnd)
-    if not parent:
-        return  # never pinned (survive_show_desktop off) -- DWM handles it
-
-    origin = ctypes.wintypes.POINT(old_rect.left, old_rect.top)
-    user32.ScreenToClient(ctypes.c_void_p(parent), ctypes.byref(origin))
-    stale = ctypes.wintypes.RECT(
-        origin.x,
-        origin.y,
-        origin.x + (old_rect.right - old_rect.left),
-        origin.y + (old_rect.bottom - old_rect.top),
-    )
-
-    RDW_INVALIDATE, RDW_ERASE = 0x0001, 0x0004
-    RDW_ALLCHILDREN, RDW_UPDATENOW = 0x0080, 0x0100
-    user32.RedrawWindow(
-        ctypes.c_void_p(parent),
-        ctypes.byref(stale),
-        None,
-        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-    )
-
-
 class Api:
     def __init__(self, window, max_height, corner_radius, translucent=False):
         self._window = window
@@ -230,97 +161,37 @@ class Api:
         # Captured before the resize, because afterwards there's no record of
         # how much of the desktop this window was covering.
         stale = (
-            window_rect(ctypes.c_void_p(self._window.native.Handle.ToInt64()))
+            native.window_rect(native.hwnd_of(self._window))
             if self._translucent
             else None
         )
         self._window.resize(width, height)
-        apply_rounded_corners(self._window, self._corner_radius)
+        native.round_corners(self._window, self._corner_radius)
         if stale is not None:
-            erase_vacated_area(self._window, stale)
-
-
-def hide_from_taskbar(window):
-    """Hides the window's taskbar button -- WS_EX_TOOLWINDOW instead of
-    WS_EX_APPWINDOW. Requires a hide/show cycle for the taskbar to actually
-    drop the button; just changing the style bit isn't enough."""
-    GWL_EXSTYLE = -20
-    WS_EX_TOOLWINDOW = 0x00000080
-    WS_EX_APPWINDOW = 0x00040000
-    SW_HIDE, SW_SHOW = 0, 5
-
-    user32 = ctypes.windll.user32
-    hwnd = ctypes.c_void_p(window.native.Handle.ToInt64())
-
-    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    style = (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
-    user32.ShowWindow(hwnd, SW_HIDE)
-    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-    user32.ShowWindow(hwnd, SW_SHOW)
-
-
-def find_workerw(user32):
-    """Finds the window to reparent onto, behind the desktop icons. Usually
-    that's a dedicated WorkerW sibling of whichever top-level window hosts
-    SHELLDLL_DefView (Windows 10 1809+), but on builds where SHELLDLL_DefView
-    is parented directly to Progman with no separate WorkerW at all (true on
-    this machine), Progman itself is the right target."""
-    progman = user32.FindWindowW("Progman", None)
-    result = ctypes.c_ulong()
-    user32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0, 1000, ctypes.byref(result))
-
-    defview_host = None
-
-    def enum_windows(hwnd_candidate, _lparam):
-        nonlocal defview_host
-        if user32.FindWindowExW(hwnd_candidate, None, "SHELLDLL_DefView", None):
-            defview_host = hwnd_candidate
-            return False  # found it, stop enumerating
-        return True
-
-    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-    user32.EnumWindows(WNDENUMPROC(enum_windows), 0)
-
-    if not defview_host:
-        return None
-
-    workerw = user32.FindWindowExW(None, defview_host, "WorkerW", None)
-    return workerw if workerw else defview_host
-
-
-def pin_to_desktop(window):
-    """Reparents the window onto the WorkerW layer behind desktop icons so
-    it survives Win+D, the same trick Rainmeter/Wallpaper Engine use. Some
-    Windows builds don't have WorkerW ready on the first message -- retry
-    a few times before giving up."""
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    user32.FindWindowW.restype = ctypes.c_void_p
-    user32.FindWindowExW.restype = ctypes.c_void_p
-    user32.FindWindowExW.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p
-    ]
-    user32.SetParent.restype = ctypes.c_void_p
-    user32.SetParent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-
-    # .ToInt64() matters: .ToInt32() truncates a 64-bit HWND on x64 Windows,
-    # producing a garbage handle that SetParent fails on silently.
-    hwnd = ctypes.c_void_p(window.native.Handle.ToInt64())
-
-    for _ in range(5):
-        workerw = find_workerw(user32)
-        if workerw:
-            user32.SetParent(hwnd, workerw)
-            print(f"Pinned to desktop (behind icons, target 0x{workerw:X})")
-            return
-        time.sleep(0.4)
-
-    print("Could not find WorkerW after 5 attempts -- Win+D persistence not applied")
+            native.erase_vacated_area(self._window, stale)
 
 
 def build_tray_image(accent):
-    """A plain colored circle, drawn with PIL rather than bundling an icon
-    file -- one less asset to ship, and it automatically matches whatever
-    accent color appearance.json has."""
+    """The tray icon: logo.png, falling back to a drawn circle.
+
+    The circle was the original and had one real advantage -- it was
+    generated from appearance.json's accent, so the tray dot always matched
+    the widget. The logo doesn't track the accent, which is the cost of
+    having the tray icon, the taskbar icon and the Start-menu shortcut all
+    be recognisably the same mark.
+
+    The resize to tray size is cached in cache/ by logo_cache, rebuilt
+    only when logo.png is newer than the cached copy.
+
+    The fallback is not dead code: ASSET_DIR points inside the unpacked
+    bundle under a frozen build, and a spec file that forgets to include
+    logo.png would otherwise leave the app with no tray icon at all -- and
+    the tray is the only control surface this widget has, since the
+    desktop layer it's pinned to receives no mouse input."""
+    img = logo_cache.tray_image()
+    if img is not None:
+        return img
+
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -355,7 +226,7 @@ def refresh_now(port, window):
     appearance = load_appearance()
     if appearance != load_appearance_snapshot():
         win = appearance.get("window", {})
-        apply_rounded_corners(window, appearance.get("corner_radius", 0))
+        native.round_corners(window, appearance.get("corner_radius", 0))
         window.move(win.get("x", 100), win.get("y", 100))
     # Written every time regardless -- otherwise the snapshot only ever
     # reflects whichever reload last found a change, not "the state as of
@@ -363,28 +234,102 @@ def refresh_now(port, window):
     save_appearance_snapshot(appearance)
 
 
+def explain_webview_failure(exc):
+    """Turns a WebView2 load failure into something actionable.
+
+    Two different causes produce almost the same message, and the fix
+    differs:
+
+      * An incomplete unpack. A onefile exe extracts itself to a temp
+        directory on every launch, and if that's interrupted -- killed
+        mid-launch, overwritten while running, a temp cleaner, antivirus
+        quarantining a DLL -- the interop assemblies are missing from an
+        otherwise working app. Relaunching fixes it, because the next run
+        extracts again.
+      * A genuinely absent WebView2 runtime. It's a built-in Edge
+        component on Windows 11, so this is rare, but it's the one case
+        that needs a download.
+    """
+    message = str(exc)
+    if "WebView2" not in message and "Core.dll" not in message:
+        return
+    print(
+        "\n[webview] Could not load the WebView2 interop layer.\n"
+        f"[webview] {message}\n"
+        "[webview] Try launching DesktopCards again -- an interrupted\n"
+        "[webview]   unpack is the usual cause and a fresh start fixes it.\n"
+        "[webview] If it keeps happening, install the WebView2 runtime:\n"
+        "[webview]   https://developer.microsoft.com/microsoft-edge/webview2/\n"
+    )
+
+
+def data_age_seconds():
+    """How long ago data.json was last written, or None if it never was."""
+    try:
+        return time.time() - os.path.getmtime(DATA_PATH)
+    except OSError:
+        return None
+
+
+def fetch_loop(interval_minutes, window):
+    """Re-pulls from Plaid on an interval, for the life of the widget.
+
+    This replaces the Windows Task Scheduler job that setup_schedule.py
+    used to register. The job worked, but it was a separate artifact
+    registered with the OS, pointing at a script path, outliving any
+    particular install and firing into a widget that might not be running
+    -- writing a data.json nobody was reading. The widget is already a
+    long-lived process that knows the interval, so the schedule belongs
+    here, where it starts and stops with the thing that displays it.
+
+    The trade: balances only refresh while the widget runs. The catch-up
+    below is what makes that acceptable -- if data.json is already older
+    than one interval, because the machine was off or the widget was
+    closed, this fetches immediately on launch instead of waiting out a
+    full interval while showing stale numbers."""
+    interval = max(1, int(interval_minutes or 90)) * 60
+
+    age = data_age_seconds()
+    wait = 0 if age is None or age >= interval else interval - age
+
+    while True:
+        time.sleep(wait)
+        wait = interval
+        try:
+            fetch_data.main()
+        except Exception as e:
+            # A failed fetch is normal and temporary (no network, Plaid
+            # rate limit, an item needing re-auth). Never fatal: the loop
+            # has to survive to try again at the next interval.
+            print(f"[fetch] scheduled refresh failed: {e}")
+            continue
+        try:
+            window.evaluate_js("reloadAll()")
+        except Exception as e:
+            print(f"[fetch] refreshed, but the page would not reload: {e}")
+
+
 def restart_now(icon, window):
     """Tray 'Restart': a full process relaunch, for the handful of
     settings 'Reload' deliberately doesn't touch (survive_show_desktop,
     or anything else that's only ever read once at startup).
 
-    Our own serve.py is terminated here, before the replacement widget is
-    spawned, rather than being left to main()'s post-webview.start()
-    cleanup. Spawning first raced the new process against this one for the
-    port: serve.py sets allow_reuse_address = False (deliberately, so a
-    second instance can't silently bind on top of a live one), so the new
-    serve.py died on startup and the new widget silently kept talking to
-    the old process -- which then outlived the widget that owned it as an
-    orphan holding the port, surviving every later restart."""
+    There's no server to shut down first any more -- it's a daemon thread
+    inside this process, so it stops when the process does. That removes
+    the hazard this function used to have to work around: a serve.py
+    subprocess outliving the widget that spawned it, holding the port as
+    an orphan and surviving every later restart.
+
+    The replacement still has to wait out TIME_WAIT on the port, but that
+    waiting now happens where it can be seen and retried, in
+    serve.build_server, rather than being assumed away by a sleep."""
     icon.stop()
-    if SERVER is not None:
-        SERVER.terminate()
-        try:
-            SERVER.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            SERVER.kill()
-    subprocess.Popen([PYTHONW, "widget.py"], cwd=PROJECT_DIR)
+    # Released before spawning, not after: the replacement checks the lock
+    # on startup, and this process is still alive at that moment.
+    native.release_single_instance()
+    spawn_self()
     window.destroy()
+    force_exit_soon()
 
 
 def make_tray_icon(port, window, appearance):
@@ -396,12 +341,31 @@ def make_tray_icon(port, window, appearance):
     def on_restart(icon, item):
         restart_now(icon, window)
 
+    def on_modify_accounts(icon, item):
+        """Opens the setup page's management view in a browser.
+
+        A separate process on purpose: it's a Flask app on its own port,
+        and nothing about it should be able to take the widget down with
+        it. The widget keeps running throughout -- the Link flow is on
+        8008/8009 while the dashboard is on 5000, so there's no conflict,
+        and newly linked banks appear on the next refresh.
+
+        This is the everyday route for adding a bank. The setup exe can
+        do it too, but nobody should have to go find a file in Downloads
+        to add a card."""
+        spawn_self("--setup")
+
     def on_quit(icon, item):
         icon.stop()
         window.destroy()
+        # Same backstop as Restart, for the same reason -- a Quit that
+        # leaves the process alive is worse, since nothing replaces it and
+        # the single-instance lock then blocks the next launch.
+        force_exit_soon()
 
     menu = pystray.Menu(
         pystray.MenuItem("Reload", on_reload),
+        pystray.MenuItem("Modify Accounts", on_modify_accounts),
         pystray.MenuItem("Restart", on_restart),
         pystray.MenuItem("Quit", on_quit),
     )
@@ -409,7 +373,24 @@ def make_tray_icon(port, window, appearance):
 
 
 def main():
-    global SERVER
+    # Before anything else, and before the port is touched. The app is
+    # launched from a Start-menu shortcut, a Startup shortcut and setup's
+    # Launch button, so a second instance is an ordinary event rather than
+    # a mistake -- it should step aside quietly, not race for the port and
+    # die with a traceback in a popup.
+    if not native.claim_single_instance():
+        print("Already running -- leaving the existing widget alone.")
+        return
+
+    # Keeps the shortcut icon in step with logo.png. The Start-menu and
+    # Startup shortcuts point at this cached .ico, and nothing else
+    # rebuilds it -- so without this, deleting the cache leaves them
+    # pointing at a missing file and showing a generic icon. It also means
+    # replacing logo.png updates those shortcuts on the next launch, which
+    # is as close to live as a shell icon gets. A cache hit after the
+    # first run, so it costs a hash of one PNG.
+    logo_cache.icon_file()
+
     config = load_config()
     appearance = load_appearance()
     save_appearance_snapshot(appearance)  # baseline for the first Reload's diff
@@ -450,7 +431,10 @@ def main():
         and float(appearance.get("opacity", 1.0)) < 0.998
     )
 
-    SERVER = start_server(port)
+    # Bound before the window exists, deliberately: if the port can't be had
+    # this raises here, where it's a reportable failure, instead of letting a
+    # window come up pointed at nothing -- the old silent-disappearance bug.
+    serve.serve_in_thread(port)
 
     window = webview.create_window(
         WINDOW_TITLE,
@@ -472,20 +456,44 @@ def main():
     api = Api(window, MAX_HEIGHT, corner_radius, translucent)
     window.expose(api.resize_window)
 
-    window.events.shown += lambda: hide_from_taskbar(window)
-    window.events.shown += lambda: apply_rounded_corners(window, corner_radius)
+    window.events.shown += lambda: native.hide_from_taskbar(window)
+    window.events.shown += lambda: native.round_corners(window, corner_radius)
 
     if win.get("survive_show_desktop", True):
-        window.events.shown += lambda: pin_to_desktop(window)
+        window.events.shown += lambda: native.pin_to_desktop(window)
 
     tray = make_tray_icon(port, window, appearance)
     threading.Thread(target=tray.run, daemon=True).start()
     window.events.closing += lambda: tray.stop()
 
-    webview.start()
-    # Already torn down if we got here via the tray's 'Restart'.
-    if SERVER.poll() is None:
-        SERVER.terminate()
+    # Lets another process ask this widget to restart (POST /restart) --
+    # setup's "Launch widget" button, when a widget is already running.
+    # Registered here rather than earlier because it closes over the tray
+    # and the window, which have to exist before it can be called.
+    serve.restart_hook = lambda: restart_now(tray, window)
+
+    # Started on 'shown' rather than here: the catch-up fetch can fire
+    # immediately, and it calls evaluate_js when it finishes, which needs a
+    # window that actually exists. Daemon, so it can't hold the process open.
+    window.events.shown += lambda: threading.Thread(
+        target=fetch_loop,
+        args=(config.get("fetch_interval_minutes"), window),
+        daemon=True,
+    ).start()
+
+    try:
+        webview.start()
+    except Exception as e:
+        # pywebview resolves and loads its WebView2 interop assemblies here,
+        # on the way to showing the window -- the one part of a frozen build
+        # most likely to fail, and the one that fails worst. Unhandled, it
+        # reaches the user as a bare traceback in a popup naming a DLL,
+        # which says nothing about what to do. Catch it to say something
+        # useful, then re-raise so the traceback still lands in the log.
+        explain_webview_failure(e)
+        raise
+    # No server teardown needed -- it's a daemon thread, so returning from
+    # here is all it takes.
 
 
 if __name__ == "__main__":

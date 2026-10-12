@@ -28,7 +28,8 @@ from plaid.model.item_public_token_exchange_request import (
 )
 from plaid.model.institutions_get_by_id_request import InstitutionsGetByIdRequest
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+from paths import CONFIG_PATH
+
 LINK_PORT = 8008
 
 ENV_MAP = {
@@ -40,8 +41,9 @@ ENV_MAP = {
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         sys.exit(
-            "config.json not found. Copy config.example.json to config.json "
-            "and fill in your Plaid client_id/secret/environment first."
+            "config.json not found. Run setup first, or copy "
+            "config.example.json to config.json and fill in your Plaid "
+            "client_id/secret/environment."
         )
     with open(CONFIG_PATH, "r") as f:
         return json.load(f)
@@ -52,21 +54,66 @@ def save_config(config):
         json.dump(config, f, indent=2)
 
 
-config = load_config()
+def build_client(config):
+    """A Plaid client for these credentials.
 
-if config.get("environment") not in ENV_MAP:
-    sys.exit(
-        f"config.json 'environment' must be one of {list(ENV_MAP)}, "
-        f"got {config.get('environment')!r}"
+    Takes the config rather than reading it, because setup_app holds
+    credentials that aren't on disk yet -- it validates them before
+    writing anything, so there's nothing to load at that point."""
+    env = config.get("environment")
+    if env not in ENV_MAP:
+        raise ValueError(
+            f"'environment' must be one of {list(ENV_MAP)}, got {env!r}"
+        )
+    plaid_config = plaid.Configuration(
+        host=ENV_MAP[env],
+        api_key={"clientId": config["client_id"], "secret": config["secret"]},
     )
+    return plaid_api.PlaidApi(plaid.ApiClient(plaid_config))
 
-plaid_config = plaid.Configuration(
-    host=ENV_MAP[config["environment"]],
-    api_key={"clientId": config["client_id"], "secret": config["secret"]},
-)
-api_client = plaid.ApiClient(plaid_config)
-client = plaid_api.PlaidApi(api_client)
 
+def new_link_token(client):
+    """A short-lived token authorising one run of the Link widget.
+
+    Also the cheapest call that proves a client_id/secret pair actually
+    works, which is how setup validates credentials before saving them."""
+    req = LinkTokenCreateRequest(
+        products=[Products("auth")],
+        required_if_supported_products=[Products("liabilities")],
+        client_name="Personal Balance Dashboard",
+        country_codes=[CountryCode("US")],
+        language="en",
+        user=LinkTokenCreateRequestUser(client_user_id="local-user"),
+    )
+    return client.link_token_create(req)["link_token"]
+
+
+def add_item(client, config, public_token, institution_name, institution_id):
+    """Exchanges a finished Link session for a lasting access token and
+    appends it to config['items'].
+
+    Appends rather than replaces -- that's what makes linking a second,
+    third or fifth bank the same operation as the first. Each Link run
+    produces its own Item with its own token."""
+    exchange_req = ItemPublicTokenExchangeRequest(public_token=public_token)
+    exchange_resp = client.item_public_token_exchange(exchange_req)
+
+    item = {
+        "access_token": exchange_resp["access_token"],
+        "item_id": exchange_resp["item_id"],
+        "institution_name": institution_name or "Unknown",
+        "institution_id": institution_id,
+        "use_custom_logo": False,
+        "logo_url": None,
+    }
+    config.setdefault("items", []).append(item)
+    save_config(config)
+    print(f"Linked: {item['institution_name']} (item_id={item['item_id']})")
+    return item
+
+
+# Standalone --link mode below. Built lazily so importing this module for
+# the helpers above costs nothing and can't exit the process.
 app = Flask(__name__)
 shutdown_event = threading.Event()
 
@@ -134,37 +181,24 @@ def index():
 
 @app.route("/create_link_token", methods=["POST"])
 def create_link_token():
-    req = LinkTokenCreateRequest(
-        products=[Products("auth")],
-        required_if_supported_products=[Products("liabilities")],
-        client_name="Personal Balance Dashboard",
-        country_codes=[CountryCode("US")],
-        language="en",
-        user=LinkTokenCreateRequestUser(client_user_id="local-user"),
-    )
-    response = client.link_token_create(req)
-    return jsonify(link_token=response["link_token"])
+    config = load_config()
+    return jsonify(link_token=new_link_token(build_client(config)))
 
 
 @app.route("/exchange_public_token", methods=["POST"])
 def exchange_public_token():
     body = request.get_json()
-    exchange_req = ItemPublicTokenExchangeRequest(public_token=body["public_token"])
-    exchange_resp = client.item_public_token_exchange(exchange_req)
-
-    config.setdefault("items", []).append(
-        {
-            "access_token": exchange_resp["access_token"],
-            "item_id": exchange_resp["item_id"],
-            "institution_name": body.get("institution_name", "Unknown"),
-            "institution_id": body.get("institution_id"),
-            "use_custom_logo": False,
-            "logo_url": None,
-        }
+    # Re-read rather than holding a module-level copy: the widget may have
+    # rewritten config.json (fetch_data backfills institution ids) while
+    # this page was open, and clobbering that is avoidable.
+    config = load_config()
+    add_item(
+        build_client(config),
+        config,
+        body["public_token"],
+        body.get("institution_name"),
+        body.get("institution_id"),
     )
-    save_config(config)
-    print(f"\nLinked: {body.get('institution_name', 'Unknown')} "
-          f"(item_id={exchange_resp['item_id']})")
     return jsonify(ok=True)
 
 
@@ -179,9 +213,13 @@ def watch_for_shutdown():
     os._exit(0)
 
 
-if __name__ == "__main__":
+def main():
     threading.Thread(target=watch_for_shutdown, daemon=True).start()
     url = f"http://localhost:{LINK_PORT}"
     print(f"Opening {url} in your browser to link a bank account...")
     threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     app.run(port=LINK_PORT)
+
+
+if __name__ == "__main__":
+    main()

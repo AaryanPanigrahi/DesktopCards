@@ -12,18 +12,18 @@
   },
   "dark_theme": false,
   "translucent_background": false,
-  "opacity": 0.85,
+  "opacity": 0.95,
   "shadow": {
-    "enabled": false,
-    "offset": 10,
-    "border": 3
+    "enabled": true,
+    "offset": 4,
+    "border": 2
   },
   "window": {
-    "x": 100,
-    "y": 100,
+    "x": 0,
+    "y": 0,
     "survive_show_desktop": true
   },
-  
+
   "layout": {
     "_comment": "Format: <Bank_Name>,<Last_4_Digits>",
     "depository": {

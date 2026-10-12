@@ -7,6 +7,16 @@ __pycache__/
 .venv/
 venv/
 .claude/
-newUI/
-potential_changes.txt
 exe_problems.md
+
+# Build output. The spec and build scripts are committed; what they
+# produce isn't. DesktopCards.ico is generated from logo.png on every
+# build, so it's output too.
+build/
+dist/
+DesktopCards.ico
+
+# Runtime log. Written whenever there's no console to print to, which
+# includes a source run under pythonw -- and from source, DATA_DIR is
+# this folder.
+desktopcards.log

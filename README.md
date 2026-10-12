@@ -30,12 +30,17 @@ on Plaid for real account data.
 | File | Role |
 |---|---|
 | `plaid_link_setup.py` | One-time (per bank) setup — opens Plaid's real Link widget in a browser so you log into your bank directly; saves the resulting access token. |
-| `fetch_data.py` | Pulls balances + credit card details from Plaid for every linked account, writes `data.json`. The only script that talks to Plaid. Run on a schedule (see below), not continuously. |
-| `serve.py` | Minimal local web server so the dashboard page can read its JSON files. Serves only an explicit allowlist of files — `config.json` (which holds the Plaid secret and access tokens) is never reachable over HTTP. Also expands `appearance.json` into what the page needs on every request. |
-| `widget.py` | Launches the pinned window itself: starts `serve.py`, opens a frameless WebView2 window at the configured position/size, hides it from the taskbar, pins it behind the desktop icons so it survives Win+D, clips it to rounded corners, and runs the system tray icon (Reload/Restart/Quit). |
+| `fetch_data.py` | Pulls balances + credit card details from Plaid for every linked account, writes `data.json`. The only script that talks to Plaid. Runs on an interval timer inside the widget, not continuously. |
+| `serve.py` | Minimal local web server so the dashboard page can read its JSON files. Serves only an explicit allowlist of files — `config.json` (which holds the Plaid secret and access tokens) is never reachable over HTTP. Also expands `appearance.json` into what the page needs on every request. Normally hosted as a thread inside `widget.py`; still runnable on its own for debugging the page. |
+| `widget.py` | Launches the pinned window itself: hosts the server, opens a frameless WebView2 window at the configured position/size, hides it from the taskbar, pins it behind the desktop icons so it survives Win+D, clips it to rounded corners, runs the interval fetch, and runs the system tray icon (Reload/Restart/Quit). |
 | `dashboard.html` / `dashboard.js` | The widget's UI and all its behavior (rendering, auto-refresh, auto-resize). |
+| `paths.py` | Where every file lives. Splits read-only bundled assets from writable per-user data, which a packaged build requires and a source checkout collapses back into one folder. |
+| `platform_win.py` | Every Windows-specific call in one file — rounded-corner clipping, taskbar hiding, desktop pinning, the accent-colour registry read. Isolated so another platform means writing a sibling, not unpicking this one. |
 | `accent_color.py` | Reads your current Windows accent color and writes it into `appearance.json`. |
-| `setup_schedule.py` | Registers the Windows Task Scheduler job that runs `fetch_data.py` on a repeating interval. |
+| `desktopcards.py` | The entry point. Every mode is a flag on this one file (`--serve`, `--fetch`, `--link`, `--accent`, `--setup`, or nothing for the widget). |
+| `setup_app.py` | First-run setup and the management view, as a local web page — credentials, Plaid Link, a verifying fetch, install and shortcuts. |
+| `logo_cache.py` | Caches the derived copies of `logo.png` (tray PNG, shortcut `.ico`) in `cache/`. |
+| `build.py` / `DesktopCards.spec` / `make_icon.py` | Produce `dist/DesktopCards.exe` — see Building the executable. |
 | `appearance.json` | Appearance, window placement, and layout/ordering settings, all in one file (see below). **Gitignored** — it holds your personal monitor position, same reasoning as `config.json`. |
 | `appearance.example.json` | A placeholder-position template of `appearance.json`, for the same sharing reason as `config.example.json`. |
 | `cache/logos/` | Cached institution logos (one PNG per bank). Gitignored, like `config.json`. |
@@ -50,7 +55,7 @@ on Plaid for real account data.
 | `client_id`, `secret`, `environment` | Your Plaid API credentials and environment (`sandbox` or `production`). |
 | `items` | The linked banks' access tokens, populated automatically by `plaid_link_setup.py`. Each one also carries `use_custom_logo`/`logo_url` — see Logos below. |
 | `port` | Local port `serve.py` runs on. |
-| `fetch_interval_minutes` | How often `fetch_data.py` should run. Change this, then re-run `setup_schedule.py` to apply it. |
+| `fetch_interval_minutes` | How often to re-pull from Plaid. Read at launch by the widget's own timer, so a change applies on the next Restart — there's no schedule registered with Windows to re-apply. |
 
 ## Appearance, window, and layout (`appearance.json`)
 
@@ -402,7 +407,7 @@ color.
 
 ## How a refresh actually happens
 
-Only `fetch_data.py` calls Plaid: on its own schedule (Task Scheduler, every
+Only `fetch_data.py` calls Plaid: on the widget's interval timer (every
 `fetch_interval_minutes`), or on demand via the tray's "Reload". It makes 2
 Plaid calls per linked bank (balance + liabilities), fetched for all your
 banks at once rather than one after another, plus one extra (one-time)
@@ -423,29 +428,307 @@ brand new), and `widget.py` only re-clips/repositions the native window
 when `appearance.json` actually differs from last time — both are otherwise
 silent no-ops instead of redundant work on every single click.
 
+### The interval timer
+
+`fetch_loop` in `widget.py` re-pulls from Plaid every
+`fetch_interval_minutes`, for the life of the widget. This used to be a
+Windows Task Scheduler job registered by a `setup_schedule.py` script. The
+job worked, but it was a separate artifact registered with the OS, pointing
+at a script path, outliving any particular install and firing whether or not
+the widget was running — writing a `data.json` nobody was reading.
+
+The trade is that **balances only refresh while the widget runs.** What makes
+that acceptable is the catch-up: if `data.json` is already older than one
+interval, because the machine was off or the widget was closed, the timer
+fetches immediately on launch rather than waiting out a full interval while
+showing stale numbers.
+
+A failed fetch (no network, a Plaid rate limit, an item needing re-auth) is
+logged and skipped, never fatal — the loop has to survive to try again.
+
 ### Restart and the port
 
 The tray's **Restart** is a full process relaunch, for the settings that are
 only read once at startup (`survive_show_desktop`, `translucent_background`,
-`page_background`). It kills its own `serve.py` before spawning the
-replacement widget — spawning first raced the two processes for the port.
+`page_background`, `fetch_interval_minutes`).
 
-The replacement then can't just assume its own `serve.py` came up.
+The server is a daemon thread inside the widget process, so there's nothing
+to shut down first and nothing that can outlive its widget — an earlier
+version spawned `serve.py` as a subprocess, which could be orphaned and sit
+on the port through every later restart.
+
+The replacement process still has to get the port back, though.
 `serve.py` sets `allow_reuse_address = False` deliberately, so a second
-instance can't quietly bind on top of a live one, which also means the
-previous instance's listening socket sitting in `TIME_WAIT` makes the bind
-fail outright — and Restart lands well inside that window. This used to be a
-flat `time.sleep(1)`, which made the failure silent and baffling: `serve.py`
-died, the sleep expired anyway, and the window came up pointed at a port with
-nothing behind it, so the widget just disappeared with no error anywhere (both
-processes run under `pythonw`, so there's no console to print to).
+instance can't quietly bind on top of a live one — which also means sockets
+from the previous instance sitting in `TIME_WAIT` make the bind fail
+outright, and Restart lands well inside that window. This used to be papered
+over with a flat `time.sleep(1)`, which made the failure silent and baffling:
+the server died, the sleep expired anyway, and the window came up pointed at
+a port with nothing behind it, so the widget just disappeared with no error
+anywhere (it runs under `pythonw`, so there's no console to print to).
 
-`start_server()` in `widget.py` replaces that sleep: it spawns `serve.py` and
-polls until the port actually answers, retrying with increasing backoff if the
-child exits — `TIME_WAIT` is a wait-it-out problem, not one that retrying
-faster solves. If the server is running but not yet answering it's handed over
-anyway, since the page retries its own fetches and killing a live server would
-only put us back in the hole.
+`serve.build_server()` retries the bind instead, waiting half a second
+between attempts — `TIME_WAIT` is a timer, not a contended lock, so waiting
+it out is the fix and retrying faster wouldn't help. If the port never frees
+up it raises, because that's a genuinely different problem (something else
+owns it) and deserves to be reported rather than retried forever. It's bound
+before the window is created, so that failure can't produce a window pointed
+at nothing.
+
+### One lock for two callers
+
+The tray's "Reload" and the interval timer can both land on
+`fetch_data.main()` at the same moment, and both end by rewriting
+`config.json` and `data.json` wholesale. `fetch_data` holds a module-level
+lock so the two serialize; the loser would have been wasted work anyway.
+
+## Building the executable
+
+```
+python build.py
+```
+
+Produces two files in `dist/`, both 31.6 MB:
+
+| File | What it's for |
+|---|---|
+| `DesktopCards.exe` | The widget. |
+| `DesktopCards-Setup.exe` | First-run setup. |
+
+They are **the same binary under two names.** `desktopcards.py` checks its
+own filename: a name containing "setup" runs setup, anything else runs the
+widget. So there's one build, one thing to download, and a new user can't
+click the wrong file first — the launcher doesn't exist until setup has made
+it. An explicit flag (`--serve`, `--fetch`, `--link`, `--accent`, `--setup`)
+always wins over the name, so neither file is ever a dead end.
+
+Everything is bundled: Python, plaid-python, Pillow, pystray, Flask, and
+pywebview with its .NET interop. The only thing not carried is the WebView2
+runtime, which is a built-in Edge component on Windows 11.
+
+### One entry point
+
+Three places used to spawn Python by name — `pythonw.exe serve.py`,
+`pythonw.exe widget.py`, and a Task Scheduler command line. All three break
+in a frozen build for the same reason: `sys.executable` *is* the app, it
+takes no script argument, and there are no `.py` files on disk to point at.
+`desktopcards.py` replaces them with subcommands, so `sys.executable` plus a
+flag covers every case, from source and frozen alike.
+
+### No console, so output goes to a file
+
+The widget is a desktop ornament and can't have a console window behind it.
+But PyInstaller sets `sys.stdout` and `sys.stderr` to `None` in a windowed
+build rather than to something inert, so every `print()` in the codebase
+would raise `AttributeError` on `None.write` — harmless progress messages
+becoming crashes, in the build where they're hardest to see.
+
+`redirect_output_to_log()` points both at
+`%LOCALAPPDATA%\DesktopCards\desktopcards.log`. That also buys the one thing
+this app otherwise can't produce: a record of what went wrong. pywebview's
+known-worst failure mode is coming up as a blank window with no traceback
+anywhere and no tray icon either — and the tray is the only control surface,
+since the desktop layer the widget is pinned to receives no mouse input. The
+log is the difference between diagnosing that and guessing.
+
+It also means **setup can't be a terminal prompt.** It runs in the browser,
+which is where the Plaid Link flow already lives.
+
+### The icon
+
+`logo.png` is the single source of truth for the mark. `make_icon.py`
+generates `DesktopCards.ico` from it on every build — seven embedded sizes
+from 16px to 256px, because Windows picks whichever fits the context it's
+drawing in rather than scaling one badly.
+
+The tray icon loads `logo.png` directly at runtime and downsizes it to 64px,
+since the tray slot is 16–32px and the source is 1024px square. It falls
+back to a drawn accent-coloured circle if the file can't be read — not dead
+code, because a spec file that forgot to bundle `logo.png` would otherwise
+leave the app with no tray icon, and therefore no way to control it.
+
+**Replacing the logo.** From source, edit `logo.png` and it takes effect
+immediately. In the packaged build the bundled copy is sealed inside the exe,
+so dropping a `logo.png` into `%LOCALAPPDATA%\DesktopCards\` overrides it —
+that path wins whenever it exists, and the tray resolves it per call rather
+than at import. The log says which one it used.
+
+The **exe's own icon is different** and can't work that way: Windows reads it
+from a resource compiled into the executable, so changing it requires a
+rebuild. `python build.py` regenerates the `.ico` from `logo.png` first, so a
+rebuild is all it takes.
+
+### Hidden imports
+
+`desktopcards.py` imports each mode's dependencies inside its own branch, so
+asking for `--fetch` doesn't load pywebview and the whole .NET interop layer.
+That's good for startup cost and invisible to PyInstaller's static analysis —
+a function-local import isn't one it can follow. The spec names them
+explicitly, which is what keeps the non-default subcommands in the bundle.
+
+The build also warns about missing `System`, `Microsoft.Web` and
+`System.Drawing`. Those are .NET assemblies that pythonnet resolves at
+runtime through its own import hook, not Python modules, so PyInstaller
+can't see them statically. They're expected and harmless.
+
+### Known rough edges
+
+- **Unsigned**, so the first run trips SmartScreen: *Windows protected your
+  PC* → More info → Run anyway. A code-signing certificate is the only real
+  fix.
+- Onefile costs a second or two of unpacking per launch, irrelevant for
+  something launched once and left pinned.
+- Rebuilding while the widget is running fails, because PyInstaller replaces
+  the exe and Windows won't allow that for a file that's executing.
+  `build.py` checks first and says so plainly. It checks both names — they're
+  the same binary, and the setup copy is just as likely to be the one left
+  open.
+- **A hard kill leaves a temp directory behind.** A onefile exe unpacks
+  itself to `%TEMP%\_MEIxxxxx` on every launch and deletes it on exit, but
+  only on a *clean* exit. `Stop-Process -Force` (or a crash) skips the
+  cleanup, and each orphan is a full ~35MB copy of the bundle. Quitting from
+  the tray is clean; if you've been force-killing it during development,
+  `Remove-Item $env:TEMP\_MEI* -Recurse -Force` reclaims the space.
+- An **interrupted unpack** leaves the app present but missing its WebView2
+  interop DLLs, which surfaces as `Cannot find
+  Microsoft.Web.WebView2.Core.dll`. Relaunching fixes it, because the next
+  run extracts again. `explain_webview_failure` says that in the log rather
+  than letting a bare traceback name a DLL and offer no advice — this is the
+  single most likely thing to go wrong in a frozen build, so it's worth
+  handling by name.
+
+## Setup, and adding accounts later
+
+Run `DesktopCards-Setup.exe` (or `--setup` from source). It opens a page in
+your browser and walks through five steps:
+
+1. **Plaid credentials.** Validated against the real API *before* anything is
+   written — creating a link token is the cheapest call that proves a
+   client_id/secret pair works, and wrong credentials are the single most
+   likely setup mistake. Failing here, with the fields still on screen,
+   beats saving bad credentials and looking like a broken app later.
+2. **Link a bank.** Plaid's own hosted widget, so your bank password never
+   passes through DesktopCards. Repeatable — each run adds another bank.
+3. **Check it works.** One real fetch. This is the step worth insisting on:
+   everything before it can succeed and still leave you looking at an empty
+   widget, and this is where that becomes a message instead of a mystery.
+4. **Install.** Copies the exe to `%LOCALAPPDATA%\DesktopCards\` and writes
+   a Start-menu shortcut, optionally a Startup one.
+5. **Launch.**
+
+Run it again and it skips to a **management view** instead: the linked banks,
+with buttons to add or remove one and to redo the shortcuts.
+
+The page is served on localhost only, and `/api/state` deliberately carries
+no `client_id` or `secret` — the page never needs them back, and not sending
+them means they can't end up in a browser cache or a screenshot.
+
+### Why it's a web page
+
+The packaged build is windowed, so there's no console to prompt in. And the
+Plaid Link step has to happen in a browser regardless, because that's where
+Plaid hosts it. Given one step is already a web page, all of them may as
+well be.
+
+### Adding a bank from the tray
+
+The widget's tray menu has **Modify Accounts**, which opens that same
+management view. That's the everyday route — nobody should have to find a
+file in Downloads to add a card. It spawns a separate process on purpose, so
+nothing about the setup page can take the widget down with it, and **the
+widget keeps running throughout**: Link is on 8008/8009 while the dashboard
+is on 5000, so there's no conflict. New banks appear on the next refresh.
+
+Removing a bank drops its access token from `config.json` but does **not**
+remove the Item at Plaid. That's deliberate — it's irreversible, and someone
+re-adding the same bank a minute later shouldn't be punished for it.
+
+### Launch when it's already running
+
+Setup's **Launch widget** button becomes **Restart widget** when a widget is
+already up, and does exactly what the tray's Restart does. Starting a second
+copy isn't an option — the single-instance lock stops it, correctly — but
+doing nothing is the wrong answer to a button press, and a restart is usually
+what's wanted anyway, since the reason to press it after changing something
+is to pick that change up.
+
+It works by asking the running widget to relaunch itself: `POST /restart` on
+the dashboard port, handled by the server thread living inside the widget
+process. `widget.py` registers the hook once the tray and window exist; a
+standalone `--serve` leaves it unset and correctly answers *"no widget in
+this process"* rather than pretending. The response is sent **before** the
+restart begins, since the restart tears down that very server.
+
+### Spawning a replacement in a frozen build
+
+Three separate bugs lived here, all invisible from source and all fixed:
+
+- **Inherited unpack directory.** PyInstaller's bootloader tells child
+  processes where it unpacked itself via `_PYI_*` environment variables.
+  That's right for a child belonging to the same run, and wrong for a
+  replacement meant to outlive us: the child skips extraction, uses our temp
+  directory, and then we exit and the bootloader deletes it underneath.
+  The symptom was `Cannot find Microsoft.Web.WebView2.Core.dll` — pointing
+  nowhere near the cause. `clean_child_env()` strips them.
+- **The working directory locked the temp folder.** `spawn_self` passed
+  `cwd=PROJECT_DIR`, which frozen is `ASSET_DIR` — *this process's own
+  `_MEIPASS`*. A process's current directory can't be deleted while it
+  lives, so the old bootloader could never clean up and never exited:
+  **one orphaned process and one undeletable ~35MB directory per restart.**
+  The replacement now starts in the exe's own folder, which is stable.
+- **Inherited handles.** The replacement is started detached
+  (`DETACHED_PROCESS`, a new process group, `close_fds`) so nothing ties it
+  to the process it's replacing.
+
+Verified by restarting four times in a row and watching the counts hold
+steady at two processes and one temp directory, with the server answering
+each time.
+
+`force_exit_soon()` is a backstop on both Restart and Quit: `window.destroy()`
+is meant to end `webview.start()` and let `main()` return, and from source it
+does. It's there in case pywebview's WinForms loop doesn't unwind, because a
+Quit that leaves the process alive is worse than a blunt exit — the
+single-instance lock would then block the next launch.
+
+### Only one widget at a time
+
+The app is launched from a Start-menu shortcut, a Startup shortcut, and
+setup's Launch button, so a second instance is an ordinary event rather than
+a mistake. `claim_single_instance` takes a named mutex before anything
+touches the port; a second instance logs *"Already running"* and exits 0.
+
+Without it the second process got as far as binding port 5000, failed, and
+died with an `OSError` traceback in a popup — the loud failure is correct in
+itself, but being shown it for double-clicking a shortcut is not.
+
+A named mutex rather than a lock file because the kernel releases it however
+the process dies, so a crash can't leave a stale lock that blocks every
+future launch. The tray's Restart releases it explicitly *before* spawning
+the replacement, since the old process is still alive at the moment the new
+one checks — otherwise Restart would quietly kill the widget instead of
+restarting it.
+
+### Cached logo derivatives
+
+`logo.png` is a 1024px square: the right thing to keep as the source, the
+wrong thing to hand to anything that draws it. `logo_cache.py` writes two
+derivatives into `cache/` and rebuilds them only when the logo actually
+changes:
+
+| File | Used for |
+|---|---|
+| `cache/logo_tray_64.png` | the tray icon |
+| `cache/logo.ico` | the Start-menu and Startup shortcut icons |
+
+Freshness is judged by **content hash, not modification time**. Under a
+onefile build the bundled `logo.png` is extracted to a new temp directory on
+every launch, so its mtime is always newer than anything cached — an mtime
+check would rebuild both derivatives every single run, which is exactly what
+the cache exists to avoid. Hashing one PNG costs far less than re-encoding
+seven `.ico` sizes.
+
+The widget rebuilds the `.ico` on startup if it's missing, so the shortcut
+icons self-heal, and replacing `logo.png` updates them on the next launch.
 
 ## Why a few of the design choices are what they are
 
