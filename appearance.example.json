@@ -29,7 +29,8 @@
     "depository": {
       "title": "Checking & Savings",
       "order": [],
-      "new_row_digit_threshold": 6
+      "new_row_digit_threshold": 6,
+      "new_row_name_length_threshold": 12
     },
     "credit": {
       "title": "Credit Cards",

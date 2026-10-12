@@ -138,6 +138,7 @@ personal to your own screen setup, so it's gitignored the same way (see
 | `layout.depository.title` / `layout.credit.title` | The section header shown above each group of cards. |
 | `layout.depository.order` / `layout.credit.order` | Which cards appear (and in what order) within that section — a list of `"Bank Name,last4"` strings (e.g. `"Chase,0000"`), matched against what's actually on the dashboard. Accounts not listed just get appended at the end. |
 | `layout.depository.new_row_digit_threshold` | How many digits a checking/savings balance needs before that card drops onto a row of its own instead of sitting two-up (default `6`, i.e. $100,000+). See Oversized balances below. |
+| `layout.depository.new_row_name_length_threshold` | How many characters an institution name can have before that card drops onto a row of its own instead of sitting two-up (default `12`). See Oversized balances below. |
 
 Width and the max-height safety ceiling aren't configuration — they're fixed
 constants in `widget.py` (`WINDOW_WIDTH`, `MAX_HEIGHT`). There's no
@@ -168,6 +169,15 @@ Raising `new_row_digit_threshold` makes cards widen in place for longer
 before breaking out; lowering it makes them break out sooner. This applies
 to the default ordering and to a hand-written `layout.depository.order`
 alike.
+
+A long institution name hits the same wall, but skips the "widen in place"
+step: there's no digit-style per-character cost to size a box against free
+text, so a name over `new_row_name_length_threshold` characters (default
+`12`) goes straight to a row of its own instead. Without this, the name is
+clipped with an ellipsis inside a box still sized for a short one — fine
+for "Chase", unreadable for a longer institution name. Raising the
+threshold lets longer names stay two-up (and get ellipsized); lowering it
+sends more names to their own row.
 
 Editing `appearance.json` takes effect on the dashboard's next load for
 appearance — `serve.py` reads it fresh on every request, so there's no sync

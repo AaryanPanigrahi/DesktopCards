@@ -186,6 +186,7 @@ const DEBIT_PX_PER_DIGIT = 16;
 const CREDIT_BALANCE_PX_PER_DIGIT = 20;
 const CREDIT_LIMIT_PX_PER_DIGIT = 8;
 const DEFAULT_NEW_ROW_DIGITS = 6;
+const DEFAULT_NEW_ROW_NAME_LENGTH = 12;
 
 function intDigits(n) {
   return Math.floor(Math.abs(n ?? 0)).toString().length;
@@ -209,11 +210,22 @@ function creditExtraPx(acc) {
     + (acc.limit ? digitsOver(acc.limit) * CREDIT_LIMIT_PX_PER_DIGIT : 0);
 }
 
+// A long institution name hits the same wall a long balance does: the
+// two-up box is sized by debitBaseWidth(), not by what any particular name
+// needs, and unlike the balance there's no digit count to widen the box
+// against -- a name is free text, not a number with a known per-character
+// cost. So instead of widening in place, it goes straight to a row of its
+// own past the threshold, same as an oversized balance jumping straight to
+// digitsOver(...) >= newRowDigits with no in-between "widen" step.
+function nameNeedsOwnRow(acc, nameLengthThreshold) {
+  return (acc.institution_name || '').length > nameLengthThreshold;
+}
+
 // Same idea as a long word in a line of text: one that's only slightly too
 // long stays put and takes the slack, one that's far too long drops onto a
 // line of its own. Pairing resumes after it, so a card that breaks out
 // doesn't reshuffle the cards around it.
-function layoutDebitRows(accounts, newRowDigits) {
+function layoutDebitRows(accounts, newRowDigits, nameLengthThreshold) {
   const rows = [];
   let pending = null;
   const flushPending = () => {
@@ -221,7 +233,7 @@ function layoutDebitRows(accounts, newRowDigits) {
     pending = null;
   };
   for (const acc of accounts) {
-    if (intDigits(acc.balance) >= newRowDigits) {
+    if (intDigits(acc.balance) >= newRowDigits || nameNeedsOwnRow(acc, nameLengthThreshold)) {
       flushPending();
       rows.push({ cards: [acc], full: true });
     } else if (pending) {
@@ -598,12 +610,16 @@ async function load() {
     // the credit section renders after the debit one.
     const depositoryDef = layout.depository || DEFAULT_LAYOUT.depository;
     const newRowDigits = depositoryDef.new_row_digit_threshold || DEFAULT_NEW_ROW_DIGITS;
+    const newRowNameLength = depositoryDef.new_row_name_length_threshold || DEFAULT_NEW_ROW_NAME_LENGTH;
     const widest = (list, measure) => list.reduce((max, a) => Math.max(max, measure(a)), 0);
     const creditExtra = widest(accounts.filter(a => a.type === 'credit'), creditExtraPx);
-    // Cards that break onto a row of their own are left out: they span the
-    // whole row already, so they never widen a box.
+    // Cards that break onto a row of their own (oversized balance or an
+    // overlong name) are left out: they span the whole row already, so they
+    // never widen a two-up box.
     const debitExtra = widest(
-      accounts.filter(a => a.type === 'depository' && intDigits(a.balance) < newRowDigits),
+      accounts.filter(a => a.type === 'depository'
+        && intDigits(a.balance) < newRowDigits
+        && !nameNeedsOwnRow(a, newRowNameLength)),
       debitExtraPx,
     );
     const extraWidth = creditExtra + debitExtra;
@@ -625,7 +641,7 @@ async function load() {
       // half of the window on whitespace.
       if (type === 'depository') {
         html += '<div class="card-grid">';
-        for (const row of layoutDebitRows(ordered, newRowDigits)) {
+        for (const row of layoutDebitRows(ordered, newRowDigits, newRowNameLength)) {
           html += `<div class="debit-row${row.full ? ' debit-row-full' : ''}">`;
           // A full-row card spans the row on its own (CSS), so it needs no
           // width of its own here.
