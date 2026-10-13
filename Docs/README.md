@@ -157,15 +157,16 @@ root. Paths below are given bare for readability.
 |---|---|
 | `plaid_link_setup.py` | One-time (per bank) setup – opens Plaid's real Link widget in a browser so you log into your bank directly; saves the resulting access token. |
 | `fetch_data.py` | Pulls balances + credit card details from Plaid for every linked account, writes `data.json`. The only script that talks to Plaid. Runs on an interval timer inside the widget, not continuously. |
-| `serve.py` | Minimal local web server so the dashboard page can read its JSON files. Serves only an explicit allowlist of files – `config.json` (which holds the Plaid secret and access tokens) is never reachable over HTTP. Loopback-bound and behind `net_guard`. Also expands `appearance.json` into what the page needs on every request. Normally hosted as a thread inside `widget.py`; still runnable on its own for debugging the page. |
+| `serve.py` | Minimal local web server so the dashboard page can read its JSON files. Serves only an explicit allowlist of files – `config.json` (which holds the Plaid secret and access tokens) is never reachable over HTTP. Loopback-bound and behind `net_guard`. Also expands `appearance.json` into what the page needs on every request. Normally hosted as a thread inside `widget.py`; still runnable on its own for debugging the page, where `POST /restart` and `POST /quit` correctly report that there is no widget here to act on. |
 | `widget.py` | Launches the pinned window itself: hosts the server, opens a frameless WebView2 window at the configured position/size, hides it from the taskbar, pins it behind the desktop icons so it survives Win+D, clips it to rounded corners, runs the interval fetch, and runs the system tray icon (Reload / Modify / Restart / Quit). |
 | `dashboard.html` / `dashboard.js` | The widget's UI and all its behavior (rendering, auto-refresh, auto-resize). |
 | `paths.py` | Where every file lives. Splits read-only bundled assets from writable per-user data, which a packaged build requires and a source checkout collapses back into one folder. |
-| `platform_win.py` | Every Windows-specific call in one file – rounded-corner clipping, taskbar hiding, desktop pinning, the accent-colour registry read. Isolated so another platform means writing a sibling, not unpicking this one. |
+| `platform_win.py` | Every Windows-specific call in one file – rounded-corner clipping, taskbar hiding, desktop pinning, the accent-colour registry read, shortcuts, and the uninstaller's three OS pieces: the task dialog, the Add/Remove Programs entry, and the deferred self-delete. Isolated so another platform means writing a sibling, not unpicking this one. |
 | `net_guard.py` | The one definition of "did this request really come from this machine?", shared by all three servers. Loopback binding keeps them off the network; this is what keeps the local browser from being used as a way in. See Who can reach these servers. |
 | `accent_color.py` | Reads your current Windows accent color and writes it into `appearance.json`. |
-| `desktopcards.py` | The entry point. Every mode is a flag on this one file (`--serve`, `--fetch`, `--link`, `--accent`, `--setup`, or nothing for the widget). |
+| `desktopcards.py` | The entry point. Every mode is a flag on this one file (`--serve`, `--fetch`, `--link`, `--accent`, `--setup`, `--uninstall`, or nothing for the widget). Two modes are also selected by filename, for the copies people double-click rather than type. |
 | `setup_app.py` | First-run setup and the management view, as a local web page – credentials, Plaid Link, a verifying fetch, install and shortcuts, plus the tabbed Accounts/Appearance settings editor (see Settings without editing JSON). |
+| `uninstall.py` | Removes the app: closes a running widget, deletes the shortcuts, the Add/Remove entry and (unless you keep them) your settings, then deletes the installed exes and itself from outside the process. Reached as `Uninstall.exe`, from Settings > Apps, or with `--uninstall` (see Uninstalling). |
 | `logo_cache.py` | Caches the derived copies of `logo.png` (tray PNG, shortcut `.ico`) in `cache/`. |
 | `build.py` / `DesktopCards.spec` / `make_icon.py` | Produce `dist/DesktopCards.exe` – see Building the executable. |
 | `logo.png` | The single source of truth for the app's mark – exe icon, Start-menu shortcut, and tray icon all derive from it. At the repo root rather than in `source/`, because it's the project's own identity rather than part of the dashboard. |
@@ -643,7 +644,7 @@ executing locally:
 | | What it does |
 |---|---|
 | **DNS rebinding** | `attacker.com` is published with a one-second TTL, then re-resolved to `127.0.0.1`. The attacker's own JavaScript fetches `http://attacker.com:5000/data.json`, which the browser now treats as same-origin, so it can **read** the reply. Loopback is no defence: the connection genuinely is local. |
-| **CSRF** | A cross-origin page POSTs to `/refresh`, `/restart` or `/api/quit`. It can't read the response and doesn't need to in order to force a Plaid pull or kill a server. |
+| **CSRF** | A cross-origin page POSTs to `/refresh`, `/restart`, `/quit` or `/api/quit`. It can't read the response and doesn't need to in order to force a Plaid pull or kill a server. |
 
 The rebinding one was live and measured, not theoretical:
 
@@ -792,7 +793,9 @@ lock so the two serialize; the loser would have been wasted work anyway.
 python source/build.py
 ```
 
-Produces two files in `dist/` at the repo root, both about 31.7 MB. The build
+Produces two files in `dist/` at the repo root, both about 31.7 MB. A third
+name exists but isn't built here: the install step copies the same binary to
+`Uninstall.exe` in `%LOCALAPPDATA%\DesktopCards\` (see Uninstalling). The build
 runs with the repo root as its working directory so `dist/` and `build/` land
 there rather than inside `source/`, and `DesktopCards.spec` therefore resolves
 every one of its inputs from `SPECPATH` (its own folder) instead of the
@@ -806,13 +809,20 @@ comes from when running from the repo.
 |---|---|
 | `DesktopCards.exe` | The widget. |
 | `DesktopCards-Setup.exe` | First-run setup. |
+| `Uninstall.exe` | The uninstaller. Not in `dist/` – written at install time, beside the installed app. |
 
-They are **the same binary under two names.** `desktopcards.py` checks its
-own filename: a name containing "setup" runs setup, anything else runs the
-widget. So there's one build, one thing to download, and a new user can't
-click the wrong file first – the launcher doesn't exist until setup has made
-it. An explicit flag (`--serve`, `--fetch`, `--link`, `--accent`, `--setup`)
-always wins over the name, so neither file is ever a dead end.
+They are **the same binary under three names.** `desktopcards.py` checks its
+own filename: a name containing "uninstall" uninstalls, one containing
+"setup" or "install" runs setup, anything else runs the widget. So there's
+one build, one thing to download, and a new user can't click the wrong file
+first – the launcher doesn't exist until setup has made it. An explicit flag
+(`--serve`, `--fetch`, `--link`, `--accent`, `--setup`, `--uninstall`) always
+wins over the name, so no copy of it is ever a dead end.
+
+The order of those two filename checks is load-bearing, and the one trap in
+the scheme: `Uninstall.exe` contains the string `install`, so uninstall is
+tested first. Reversed, double-clicking the uninstaller would reinstall the
+app.
 
 Everything is bundled: Python, plaid-python, Pillow, pystray, Flask, and
 pywebview with its .NET interop. The only thing not carried is the WebView2
@@ -1183,6 +1193,19 @@ process. `widget.py` registers the hook once the tray and window exist; a
 standalone `--serve` leaves it unset and correctly answers *"no widget in
 this process"* rather than pretending. The response is sent **before** the
 restart begins, since the restart tears down that very server.
+
+### Asking it to quit
+
+`POST /quit` is the same shape as `/restart` and exists for one caller: the
+uninstaller, which has to get the widget out of the way before it can delete
+the exe that widget is running from. It runs `quit_now()` – the tray's own
+Quit – so the tray stops, the window closes, the single-instance lock is
+released and the 2.5s `force_exit_soon` backstop still applies.
+
+Asking rather than killing is the point. `taskkill` would leave the lock
+held by a dead process, and the next install would then come up believing a
+widget was already running. The uninstaller does keep a kill as a backstop,
+but only for something still answering on the port after being asked.
 
 ### Spawning a replacement in a frozen build
 
