@@ -1210,6 +1210,12 @@ PAGE = r"""<!doctype html>
     border-color: var(--btn-line);
   }
   input:focus, select:focus { outline: none; border-color: var(--accent); }
+  /* The closed box stays transparent so it can sit on any of the three
+     backdrops, but the popup list is a separate native surface: it takes
+     the select's own background, which transparent resolves to white in
+     both themes, leaving near-white option text readable only under the
+     hover highlight. The options carry a real card fill of their own. */
+  select option { background: var(--card); color: var(--text); }
   /* Every box is raised while it is waiting for you, and the one you click
      into drops to the page -- the same move the layout rows make, so being
      edited looks the same wherever it happens. */
