@@ -76,6 +76,15 @@ a reinstall; clear it and the folder goes entirely. Your banks stay linked at
 Plaid either way. From a checkout:
 `python source/desktopcards.py --uninstall`.
 
+## Changelog
+### Version 1.1
+- Fresh Config UI
+    - Simplified initial setup 
+    - Accounts/Layout/Appearance Tabs
+    - Light/Dark Theme (same as widget)
+    - Shadows for elements
+ - Uninstall script and windows settings integration
+
 ## What's in this repo
 
 | | |
