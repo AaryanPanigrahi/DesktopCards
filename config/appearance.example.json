@@ -18,12 +18,23 @@
     "offset": 4,
     "border": 2
   },
+  "shadow_ui": {
+    "_comment": "The setup page's own controls, not the widget. No editor field: this one is file-only. offset also accepts a single number for every group.",
+    "enabled": true,
+    "color": null,
+    "offset": {
+      "tabs": 3,
+      "inputs": 3,
+      "checkboxes": 2,
+      "rows": 3,
+      "buttons": 3
+    }
+  },
   "window": {
     "x": 0,
     "y": 0,
     "survive_show_desktop": true
   },
-
   "layout": {
     "_comment": "Format: <Bank_Name>,<Last_4_Digits>",
     "depository": {

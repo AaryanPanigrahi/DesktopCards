@@ -60,6 +60,12 @@ to add banks and pick which to show, **Layout** to drag cards into order, and
 **Appearance** for everything in the list above. The tray also has Reload,
 Restart and Quit.
 
+One setting isn't on that page: `shadow_ui` in `config/appearance.json` gives
+the settings page's own tabs, boxes and buttons the same hard shadow the cards
+have. It's file-only on purpose – a control that restyles the control you're
+holding is a toy rather than a setting. Set `enabled` to `false`, or tune the
+distances per group, and reload the page.
+
 ## What's in this repo
 
 | | |

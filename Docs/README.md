@@ -149,6 +149,9 @@ personal to your own screen setup, so it's gitignored the same way (see
 | `shadow.offset` | How far the shadow is thrown down and to the right, in pixels. There's no blur – it's a solid block, so this is the whole of its size. |
 | `shadow.border` | Thickness of the outline drawn around each card in the same color, in pixels. `0` gives the shadow without the outline. |
 | `shadow.color` | Color of both the shadow and that border. Leave it out and it follows the theme – near-black on light, a darker near-black on dark. Setting it pins one color across both themes. |
+| `shadow_ui.enabled` | Turns on the matching hard shadow for the **settings page's own** controls – its tabs, boxes, tickboxes, rows and buttons, not the widget's cards. `false` (or every distance `0`) leaves the page flat. There is no form field for this one: see Shadows on the settings page below. |
+| `shadow_ui.offset` | How far those shadows are thrown, in pixels. Either a block of per-group distances – `tabs`, `inputs`, `checkboxes`, `rows`, `buttons` – or a single number for all of them. Clamped to `0`–`10`. Unlike the cards there's no border term: these controls have their own. |
+| `shadow_ui.color` | Color of the page's shadows. Leave it out (or `null`) and each theme picks its own – a near-black on dark, a slate on light, since near-black on white reads as a hole rather than a shadow. |
 | `dark_theme` | `true` swaps the whole palette for the dark one, and is the shipped default. See Dark theme below. |
 | `translucent_background` | `true` lets the desktop wallpaper show through the widget. See Translucency below. |
 | `opacity` | How opaque the widget is, `0`–`1`, when `translucent_background` is on. Not applied uniformly – the page backdrop takes this value in full and the cards, bars and text give up progressively less of theirs, so text stays readable. `1` switches the whole effect off (see Translucency), and anything below `0.15` is clamped to it. |
@@ -242,6 +245,60 @@ pinned at 8px because `distributeRowWidths` does its arithmetic against it –
 so at a large offset the right-hand card covers the far end of its
 neighbour's shadow. That reads as the shadow tucking underneath it, which is
 what the style does anyway.
+
+### Shadows on the settings page
+
+`shadow_ui` is the same trick turned on the settings page itself: a solid,
+un-blurred shadow at a 45° offset, so the page you configure the widget from
+casts the same kind of light the widget does. It is a separate key from
+`shadow` because it describes a different surface – changing the cards'
+shadow has never had anything to do with the page's own chrome.
+
+**It is deliberately file-only.** There is no row for it in the Appearance
+tab, and that is the point: a control that restyles the control you are
+holding is a toy rather than a setting. Edit `appearance.json` and reload the
+page. Nothing is lost by saving from the browser meanwhile – the Appearance
+tab preserves keys it has no fields for, and the save endpoint also takes
+`shadow_ui` from disk rather than from the request, so a tab left open since
+before your edit can't write a stale copy back over it (the same guard
+`layout` gets).
+
+**One distance per group of controls**, because they are nothing like the same
+size: 3px under a full-width text box is a hairline, and the same 3px under a
+17px tickbox is a third of the control. The groups are `tabs`, `inputs`
+(text, number, select and the colour wells), `checkboxes`, `rows` (the Layout
+tab's draggable cards and the Accounts tab's rows) and `buttons`. A new
+control joins a group rather than earning a key of its own.
+
+**What casts, and when:**
+
+| Group | At rest | While you're using it |
+|---|---|---|
+| Tabs | – | The selected tab casts, with no fade: selecting a tab is a jump between panels, and a shadow easing in behind it reads as the page still settling after you've moved. |
+| Boxes and colour wells | Raised | Drops to the page over 0.45s when you click into it. |
+| Tickboxes | – | Casts while ticked, and while focused from the keyboard. |
+| Rows | Raised | Drops the same way – when a Layout card is picked up to drag, or when an Accounts row is ticked. |
+| Buttons | – | Grows from nothing to full in 0.32s on hover, holds, then runs back down when the pointer leaves. Quicker than the rows on purpose: a hover is answering you, and anything you can outrun with the pointer feels like lag. Dropdown menu items opt out – a menu row sits inside something that already casts. |
+
+Three places the geometry had to bend, all for the same reason: a shadow is
+painted *outside* the element, onto whatever is next to it.
+
+- **The selected tab's shadow is clipped at the rule it sits on.** That tab's
+  bottom edge is deliberately missing so it merges into the panel below, and
+  a shadow running past the line would paint the seam back in as a dark bar.
+- **Tickboxes reserve a strip** the width of their own offset, and are given a
+  stacking position. The label text is both closer and drawn later, which was
+  clipping the corner off the shadow.
+- **Accounts rows cast from their cells, not the row.** A `<tr>` in a
+  separate-border table has no box of its own to cast one, and middle cells
+  cast straight down only – sideways, each would land on its own neighbour.
+
+The page is inert at a `0` distance: every rule spends its distance twice and
+a `0 0` shadow with no blur paints nothing, so an absent `shadow_ui`, a
+disabled one and an all-zero one are the same page. `index()` sends the
+distances as inline custom properties on `<html>`, next to the accent it
+already sends, and a non-hex colour or an unparseable distance falls back to
+the stylesheet's own rather than reaching the attribute.
 
 ## Dark theme
 

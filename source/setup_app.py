@@ -409,6 +409,74 @@ def write_appearance(appearance):
 # attribute, and appearance.json is a hand-edited file.
 _HEX_COLOR = re.compile(r"\A#[0-9a-fA-F]{3,8}\Z")
 
+# appearance.json's "shadow_ui" block, which this page reads for its own
+# controls the way the widget reads "shadow" for its cards. Deliberately
+# absent from APPEARANCE_FIELDS: the manage view styles itself from this,
+# and a control that restyles the control you are using is a toy rather
+# than a setting -- so it is edited in the file and takes effect on reload.
+SHADOW_UI_DEFAULTS = {
+    "enabled": True,
+    "color": None,
+    "offset": {"tabs": 3, "inputs": 3, "checkboxes": 2, "rows": 3, "buttons": 3},
+}
+
+# Each group of controls carries its own distance, because they are not the
+# same size: 3px under a full-width text box is a hairline, and the same
+# 3px under a 1.05rem checkbox is a third of the control. Named per group
+# rather than per element, so a new control joins a group instead of
+# needing a key of its own.
+_UI_SHADOW_PARTS = {
+    "tabs": "--ui-shadow-tab",
+    "inputs": "--ui-shadow-input",
+    "checkboxes": "--ui-shadow-check",
+    "rows": "--ui-shadow-row",
+    "buttons": "--ui-shadow-btn",
+}
+
+# Far enough to read as a drawn edge, not far enough to collide with the
+# next control. A hand-edited file gets no validation elsewhere, so the
+# clamp is the validation.
+_UI_SHADOW_MAX = 10
+
+
+def shadow_ui_css():
+    """The inline custom properties the page's shadows read, or "".
+
+    Off, or every distance 0, returns nothing at all rather than a set of
+    0px values: the stylesheet already defaults each var to 0, and every
+    shadow rule is inert at that length, so absent and off are the same
+    page.
+
+    "offset" takes either a block of per-group distances or one number for
+    all of them, so the shorter form keeps working and is still the easy
+    thing to write when the whole page wants dialling up or down."""
+    block = read_appearance().get("shadow_ui")
+    if not isinstance(block, dict):
+        block = {}
+    block = {**SHADOW_UI_DEFAULTS, **block}
+    if not block.get("enabled"):
+        return ""
+    offset = block.get("offset")
+    if not isinstance(offset, dict):
+        offset = {part: offset for part in _UI_SHADOW_PARTS}
+    props = []
+    for part, var in _UI_SHADOW_PARTS.items():
+        raw = offset.get(part, SHADOW_UI_DEFAULTS["offset"][part])
+        try:
+            px = min(_UI_SHADOW_MAX, max(0, int(raw)))
+        except (TypeError, ValueError):
+            continue
+        if px:
+            props.append(f"{var}:{px}px")
+    if not props:
+        return ""
+    color = str(block.get("color") or "")
+    # Anything else falls through to the stylesheet's per-theme default,
+    # which is the only safe answer for a value that lands in an attribute.
+    if _HEX_COLOR.match(color):
+        props.append(f"--ui-shadow-color:{color}")
+    return ";".join(props)
+
 
 @app.route("/")
 def index():
@@ -425,7 +493,9 @@ def index():
     appearance = read_appearance()
     theme = "dark" if appearance.get("dark_theme") else "light"
     accent = str(appearance.get("accent") or "")
-    style = f' style="--accent:{accent}"' if _HEX_COLOR.match(accent) else ""
+    props = [f"--accent:{accent}"] if _HEX_COLOR.match(accent) else []
+    props += [p for p in (shadow_ui_css(),) if p]
+    style = f' style="{";".join(props)}"' if props else ""
     return PAGE.replace(
         '<html lang="en">',
         f'<html lang="en" data-theme="{theme}"{style}>',
@@ -530,6 +600,14 @@ def api_appearance_save():
     # hidden toggle made while the Appearance tab sat open can't be
     # clobbered by a stale object being saved back over it.
     appearance["layout"] = read_appearance().get("layout", {})
+    # Same reasoning for the file-only shadow block: the editor has no field
+    # for it, so the object posted back carries whatever was on disk when
+    # the tab loaded, and that would overwrite an edit made since.
+    on_disk = read_appearance().get("shadow_ui")
+    if on_disk is None:
+        appearance.pop("shadow_ui", None)
+    else:
+        appearance["shadow_ui"] = on_disk
     sync_layout_order(appearance)
     write_appearance(appearance)
     print(f"wrote {APPEARANCE_PATH}")
@@ -941,13 +1019,36 @@ PAGE = r"""<!doctype html>
      rule. Dark is the base rather than the override because that's the
      shipped default (appearance.example.json), so the fallback when there
      is no appearance.json yet matches what a first run will actually get.
-     color-scheme is here for the native checkboxes, selects and the color
-     picker, which a stylesheet can't reach into. */
+     color-scheme is here for the selects and the color picker, which a
+     stylesheet can't reach into. (Checkboxes used to need it too; they're
+     drawn by the rules further down now.) */
   :root {
     --bg: #15181e; --card: #1d2128; --card-2: #23272f;
     --text: #e8eaed; --dim: #9aa0a6; --faint: #6b7280;
     --accent: #4c8dff; --ok: #34c759; --bad: #ff6b6b; --line: #2d323b;
     --hair: rgba(255,255,255,.04);
+    /* The surface button tier, kept as its own pair of tokens rather than
+       reusing --card-2/--line: a surface button sits *on* a .card, so it
+       needs a fill that reads as raised against it and a hover a step
+       further again, which is one more level than the card tokens have. */
+    --btn-bg: #262b34; --btn-bg-hover: #2f3540; --btn-line: #363d49;
+    --tick: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'><path d='M20 6 9 17l-5-5'/></svg>");
+    --dash: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3.5' stroke-linecap='round'><path d='M6 12h12'/></svg>");
+    /* The hard offset shadow these controls draw, borrowed from the
+       widget's own card shadow (appearance.json "shadow") so the two
+       surfaces cast the same kind of light. One distance per group of
+       controls, since they are nothing like the same size. Inert at 0:
+       every rule below spends its distance twice and a 0 0 shadow with no
+       blur paints nothing, so the whole feature is off until index() sends
+       one -- which it only does when appearance.json's file-only
+       "shadow_ui" block asks for it. No blur anywhere: this is a drawn
+       edge, and a blurred copy of it would read as a different control. */
+    --ui-shadow-tab: 0px;
+    --ui-shadow-input: 0px;
+    --ui-shadow-check: 0px;
+    --ui-shadow-row: 0px;
+    --ui-shadow-btn: 0px;
+    --ui-shadow-color: #0a0c11;
     color-scheme: dark;
   }
   :root[data-theme="light"] {
@@ -955,15 +1056,70 @@ PAGE = r"""<!doctype html>
     --text: #1b2230; --dim: #596070; --faint: #878f9d;
     --accent: #0b66d0; --ok: #1a8f43; --bad: #c62828; --line: #dde1e8;
     --hair: rgba(0,0,0,.05);
+    --btn-bg: #f0f2f6; --btn-bg-hover: #e4e8ef; --btn-line: #d2d8e1;
+    /* Near-black on white is a hole, not a shadow, so the light palette
+       takes the same slate the cards' borders are cut from. */
+    --ui-shadow-color: #b9c0cb;
     color-scheme: light;
   }
   * { box-sizing: border-box; }
+  /* Picking a control up drops its shadow: the distance closes to nothing,
+     so the thing you are touching settles onto the page while everything
+     around it stays raised. One keyframe serves every group because it
+     animates --ui-shadow-self, which each rule below sets to its own
+     group's distance -- a custom property resolves against the element
+     being animated, not against where the keyframes were written. */
+  @keyframes ui-shadow-settle {
+    from { box-shadow: var(--ui-shadow-self) var(--ui-shadow-self) var(--ui-shadow-color); }
+    to   { box-shadow: 0 0 var(--ui-shadow-color); }
+  }
   body {
     margin: 0; padding: 2.5rem 1rem 4rem; background: var(--bg); color: var(--text);
     font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
     display: flex; justify-content: center;
   }
+  /* Setup runs in one narrow column -- a five-step wizard is a sequence,
+     and a 1000px-wide instruction is harder to read, not easier. The
+     manage view is the opposite: three tabs of dense, unordered settings
+     that were stacked into one 620px strip with a third of the window
+     empty on either side. main.manage is set by loadState once it knows
+     which of the two the page is. */
   main { width: 100%; max-width: 620px; }
+  main.manage { max-width: 1060px; }
+
+  /* The appearance form's groups, balanced into two columns. CSS columns
+     rather than a grid because there are a dozen groups of a dozen
+     different heights: columns fill to an equal stack height, where a grid
+     would make every row as tall as its tallest cell. */
+  .cols { columns: 2; column-gap: 1.6rem; }
+  /* Spacing between groups hangs off the bottom of each block, never the
+     top: a top margin on whichever block happens to land at the head of
+     the second column would push that column out of line with the first,
+     and which block that is isn't knowable from here. */
+  .colblock { break-inside: avoid; margin-bottom: 1.5rem; }
+  .colblock:last-child { margin-bottom: 0; }
+  .colblock > h3.grp:first-child { margin-top: 0; }
+
+  /* Two halves, one each, where that's what the content is -- the accounts
+     tab ("linked banks and what to do with them" | "which of their
+     accounts get drawn") and the layout tab ("what each section is called
+     and when it breaks a row" | the lists you drag). A grid, not columns:
+     with exactly two blocks, balancing could decide they both fit in the
+     first column and leave the second empty. */
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1.8rem; }
+  .split > * { min-width: 0; }
+
+  /* For blocks that stay single-column on a wide page: a label/control row
+     stretched to 1060px leaves its two halves at opposite ends of the
+     window with nothing in between. */
+  .narrow { max-width: 560px; }
+
+  /* Below this a column is too narrow for a .fld's label and its control
+     side by side, which is the shape of nearly every row in these forms. */
+  @media (max-width: 900px) {
+    .cols { columns: 1; }
+    .split { grid-template-columns: 1fr; }
+  }
   h1 { font-size: 1.5rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
   .sub { color: var(--dim); margin: 0 0 2rem; }
   section {
@@ -982,20 +1138,339 @@ PAGE = r"""<!doctype html>
   .hint { color: var(--dim); font-size: .88rem; margin: .1rem 0 1rem 1.95rem; }
   .body { margin-left: 1.95rem; }
   label { display: block; font-size: .82rem; color: var(--dim); margin: .75rem 0 .3rem; }
-  input[type=text], input[type=password], select {
-    width: 100%; padding: .6rem .7rem; border-radius: 8px; color: var(--text);
-    background: var(--bg); border: 1px solid var(--line); font: inherit;
+  /* One shape for every box you type into, number boxes included: no
+     fill, a 2px edge and a 10px radius. The reference draws its edge
+     purely in layered shadows, which assume one fixed dark backdrop --
+     these boxes sit on three (page, card, table row) and have to survive
+     the light theme, so the border carries the shape instead and focus
+     moves its color rather than stacking another shadow on top. */
+  input[type=text], input[type=password], input[type=number], select {
+    width: 100%; padding: .55rem .7rem; border-radius: 10px; color: var(--text);
+    background: transparent; border: 2px solid var(--line); font: inherit;
+  }
+  input[type=text]:hover:not(:disabled), input[type=password]:hover:not(:disabled),
+  input[type=number]:hover:not(:disabled), select:hover:not(:disabled) {
+    border-color: var(--btn-line);
   }
   input:focus, select:focus { outline: none; border-color: var(--accent); }
-  button {
-    margin-top: 1rem; padding: .62rem 1.1rem; border-radius: 8px; border: 0;
-    background: var(--accent); color: #fff; font: inherit; font-weight: 550; cursor: pointer;
+  /* Every box is raised while it is waiting for you, and the one you click
+     into drops to the page -- the same move the layout rows make, so being
+     edited looks the same wherever it happens. */
+  input[type=text], input[type=password], input[type=number], select {
+    --ui-shadow-self: var(--ui-shadow-input);
+    box-shadow: var(--ui-shadow-self) var(--ui-shadow-self) var(--ui-shadow-color);
   }
-  button.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
-  button.danger { background: transparent; border: 1px solid var(--line); color: var(--bad);
-                  padding: .3rem .6rem; margin: 0; font-size: .8rem; }
-  button:disabled { opacity: .5; cursor: default; }
+  input[type=text]:focus, input[type=password]:focus,
+  input[type=number]:focus, select:focus {
+    animation: ui-shadow-settle .45s ease-out forwards;
+  }
+  input[type=text]:disabled, input[type=password]:disabled,
+  input[type=number]:disabled, select:disabled { box-shadow: none; }
+  @media (prefers-reduced-motion: reduce) {
+    input[type=text]:focus, input[type=password]:focus,
+    input[type=number]:focus, select:focus { animation: none; box-shadow: none; }
+  }
+  /* Every number box on the page, not just the ones in a form row: a
+     right-aligned figure ends against its unit ("8" "px") and a column of
+     them lines up on the ones digit instead of the leading one. */
+  input[type=number] { text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* ---- buttons ------------------------------------------------------
+     Chakra's button variants, as plain CSS: "surface" is the bare
+     element, so every button on the page is one unless it says
+     otherwise, and .solid is the single primary action in a group (the
+     one that writes something, or moves the setup forward). The old
+     split was the other way round -- solid by default with a .ghost
+     opt-out -- which made four solid blue buttons in a row normal, and
+     left nothing for the one that mattered to stand out with. */
+  button {
+    /* 80% of the sizes this page shipped with (.62/1.1rem at the body's
+       15px): a settings page is almost all controls, and at full size a
+       row of them read as the loudest thing on it. */
+    margin-top: 1rem; padding: .5rem .88rem; border-radius: 7px;
+    font: inherit; font-size: .86rem; font-weight: 550; cursor: pointer;
+    /* inline-flex, not the default inline-block: the loading spinner is a
+       ::before box that has to sit on the label's line and share a gap
+       with it, and baseline alignment of an inline-block won't do that. */
+    display: inline-flex; align-items: center; justify-content: center; gap: .45rem;
+    background: var(--btn-bg); color: var(--text); border: 1px solid var(--btn-line);
+    transition: background .12s ease, border-color .12s ease, box-shadow .32s ease;
+  }
+  /* The only shadow on the page that arrives rather than leaves: a button
+     is raised by being pointed at, and the distance grows from nothing to
+     full in 0.32s, holds while the pointer is on it, then runs back down
+     when it leaves. Quicker than the 0.45s the rows take to settle: a
+     hover is answering you, and anything you can outrun with the pointer
+     feels like lag rather than motion. A transition
+     rather than a keyframe because it has to be interruptible -- a
+     keyframe would snap back to 0 the moment the pointer left, and the
+     ask is for it to travel in both directions. .tab is excluded: tabs are
+     buttons only for the keyboard's sake, and they cast on selection. */
+  button:hover:not(:disabled):not(.tab) {
+    background: var(--btn-bg-hover);
+    box-shadow: var(--ui-shadow-btn) var(--ui-shadow-btn) var(--ui-shadow-color);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    button { transition: none; }
+  }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.solid { background: var(--accent); color: #fff; border-color: transparent; }
+  /* Brightness rather than a second accent token: the accent is the user's
+     Windows accent color at runtime, so there's no fixed darker shade of it
+     to name -- and this works whichever end of the range theirs is at. */
+  button.solid:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
+  button.danger { color: var(--bad); padding: .24rem .5rem; margin: 0; font-size: .72rem; }
+  /* :not(.loading) -- a loading button is disabled so it can't be pressed
+     twice, but it's mid-task rather than unavailable, and fading it makes
+     its own spinner hard to see. */
+  button:disabled:not(.loading) { opacity: .5; cursor: default; }
+
+  /* Loading state: the spinner is the button's own ::before, and the
+     label swap is loading()'s job in the script below. */
+  button.loading { cursor: default; }
+  button.loading::before {
+    content: ''; flex: 0 0 auto; width: .85em; height: .85em;
+    border: 2px solid currentColor; border-top-color: transparent;
+    border-radius: 50%; animation: btn-spin .55s linear infinite;
+  }
+  @keyframes btn-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    button.loading::before { animation-duration: 1.6s; }
+  }
+
+  /* ---- split button + its menu ----
+     Two buttons sharing a border, so the chevron reads as part of the Save
+     button rather than a second control next to it. */
+  .btn-group { display: inline-flex; vertical-align: middle; }
+  .btn-group > button { margin-top: 0; }
+  .btn-group > button:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  .btn-group > button + button {
+    border-top-left-radius: 0; border-bottom-left-radius: 0;
+    margin-left: -1px; /* the shared edge, drawn once */
+    padding-left: .44rem; padding-right: .44rem;
+  }
+  /* A solid group has no borders to hide the seam, so it gets drawn. */
+  .btn-group > button.solid + button.solid { box-shadow: inset 1px 0 0 rgba(0,0,0,.18); }
+  .btn-group svg { width: 1em; height: 1em; display: block; }
+
+  .menu-root { position: relative; display: inline-flex; }
+  .menu {
+    position: absolute; top: calc(100% + .35rem); right: 0; z-index: 20;
+    min-width: 11.5rem; padding: .25rem;
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 12px 30px rgba(0,0,0,.32);
+  }
+  .menu[hidden] { display: none; }
+  .menu button {
+    margin: 0; width: 100%; justify-content: flex-start;
+    background: transparent; border-color: transparent; border-radius: 6px;
+    padding: .38rem .5rem; font-weight: 500;
+  }
+  /* A menu item is not a button sitting on the page, it is a row inside
+     one that already casts its own shadow -- so the hover shadow every
+     other button gets is switched back off here. */
+  .menu button:hover:not(:disabled) { background: var(--btn-bg-hover); box-shadow: none; }
+
+  /* ---- checkboxes ----
+     Chakra's Checkbox.Control: a square that takes the accent and a white
+     tick when checked, in place of the OS one. Still a real
+     <input type=checkbox> underneath -- appearance: none only replaces how
+     it's painted, so the label association, keyboard behaviour and the
+     .checked reads the script already does all go on working untouched.
+     The tick is a mask rather than a border trick so it stays a tick at
+     any zoom, and takes its color from the background below it. */
+  input[type=checkbox] {
+    appearance: none; -webkit-appearance: none;
+    /* The shadow is painted outside the box, into whatever sits next to
+       it, and the label text is both closer and drawn later -- which is
+       what was clipping the corner off it. The reserved strip is the room
+       it needs; position lifts the box and its shadow above the
+       surrounding text rather than leaving the two to share pixels. */
+    position: relative;
+    margin: 0 var(--ui-shadow-check) var(--ui-shadow-check) 0;
+    flex: 0 0 auto; width: 1.05rem; height: 1.05rem;
+    display: inline-grid; place-content: center;
+    background: var(--btn-bg); border: 1px solid var(--btn-line);
+    border-radius: 4px; cursor: pointer;
+    transition: background .12s ease, border-color .12s ease;
+  }
+  input[type=checkbox]::before {
+    content: ''; width: .72rem; height: .72rem; background: #fff;
+    /* The tick, as a mask: stroke is a named color so the data URI needs
+       no escaped # inside this stylesheet. */
+    -webkit-mask: var(--tick) center / contain no-repeat;
+    mask: var(--tick) center / contain no-repeat;
+    transform: scale(.5); opacity: 0;
+    transition: transform .12s ease, opacity .12s ease;
+  }
+  input[type=checkbox]:checked {
+    background: var(--accent); border-color: var(--accent);
+  }
+  input[type=checkbox]:checked::before { transform: scale(1); opacity: 1; }
+  /* Partially selected: a dash, which is the state a select-all box is in
+     when some but not all of its rows are ticked. The <input> tracks this
+     itself via .indeterminate -- nothing here has to model it. */
+  input[type=checkbox]:indeterminate { background: var(--accent); border-color: var(--accent); }
+  input[type=checkbox]:indeterminate::before {
+    -webkit-mask: var(--dash) center / contain no-repeat;
+    mask: var(--dash) center / contain no-repeat;
+    transform: scale(1); opacity: 1;
+  }
+  /* Ticked or focused, either one: the shadow marks a box that is set, and
+     follows the keyboard as well so tabbing through a list of them reads
+     the same way as clicking. */
+  input[type=checkbox]:checked, input[type=checkbox]:indeterminate,
+  input[type=checkbox]:focus-visible {
+    box-shadow: var(--ui-shadow-check) var(--ui-shadow-check) var(--ui-shadow-color);
+  }
+  input[type=checkbox]:hover:not(:disabled) { border-color: var(--accent); }
+  input[type=checkbox]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  input[type=checkbox]:disabled { opacity: .45; cursor: default; }
+  @media (prefers-reduced-motion: reduce) {
+    input[type=checkbox]::before { transition: none; }
+  }
+
+  /* ---- switch (Chakra's Switch.Root) ----
+     What the Appearance tab's booleans all are: the widget either does
+     this or it doesn't, applied the moment it's saved. A switch says that;
+     a checkbox says "include this in a set", which is what the account
+     list and the two opt-ins elsewhere on the page actually are -- so
+     those stay checkboxes and only the appearance form opts in here.
+     Reuses the checkbox's ::before as the thumb rather than adding a
+     wrapper element, which is what keeps these real <input>s. */
+  input[type=checkbox].switch {
+    width: 2.1rem; height: 1.2rem; border-radius: 999px;
+    position: relative; place-content: stretch;
+  }
+  input[type=checkbox].switch::before {
+    -webkit-mask: none; mask: none; /* thumb, not tick */
+    position: absolute; top: 50%; left: 2px;
+    width: .82rem; height: .82rem; border-radius: 50%;
+    background: var(--dim); opacity: 1;
+    transform: translateY(-50%);
+    transition: left .15s ease, background .15s ease;
+  }
+  input[type=checkbox].switch:checked::before {
+    left: calc(100% - .82rem - 3px);
+    background: #fff; opacity: 1; transform: translateY(-50%);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    input[type=checkbox].switch::before { transition: none; }
+  }
+
+  /* ---- color picker (Chakra's ColorPicker.Control) ----
+     A hex Input next to a swatch Trigger, both editing the one value. The
+     text box is the value that gets saved, not the swatch: a swatch can
+     only hold a hex triple, and these fields also have to carry a blank
+     ("follow the theme") and any CSS color name already sitting in
+     appearance.json. .unset dims the swatch to say it isn't pinning
+     anything -- it's still showing a color, because a native
+     <input type=color> always does. */
+  .cpick { display: flex; align-items: center; gap: .35rem; min-width: 0; }
+  .cpick > .cpick-hex {
+    flex: 1 1 auto; min-width: 0; width: auto;
+    font-variant-numeric: tabular-nums;
+  }
+  .cpick > input[type=color] {
+    flex: 0 0 auto; width: 1.9rem; height: 1.8rem; padding: 0;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    cursor: pointer;
+    /* The well is a box you set a value in, so it is raised with the rest
+       of them -- and it drops the same way when you open the picker. */
+    --ui-shadow-self: var(--ui-shadow-input);
+    box-shadow: var(--ui-shadow-self) var(--ui-shadow-self) var(--ui-shadow-color);
+  }
+  .cpick > input[type=color]:focus { animation: ui-shadow-settle .45s ease-out forwards; }
+  /* The native control insets its color well inside its box; these pull
+     the fill back out to the border so it reads as a color chip. */
+  .cpick > input[type=color]::-webkit-color-swatch-wrapper { padding: 2px; }
+  .cpick > input[type=color]::-webkit-color-swatch { border: 0; border-radius: 4px; }
+  .cpick > input[type=color]::-moz-color-swatch { border: 0; border-radius: 4px; }
+  .cpick.unset > input[type=color] { opacity: .45; }
+  .cpick > .cpick-clear {
+    flex: 0 0 auto; margin: 0; padding: .1rem .25rem;
+    font-size: .95rem; line-height: 1; font-weight: 400; color: var(--faint);
+    background: transparent; border-color: transparent;
+  }
+  .cpick > .cpick-clear:hover:not(:disabled) { background: transparent; color: var(--text); }
+  .cpick.unset > .cpick-clear { visibility: hidden; }
+
+  /* ---- slider (Chakra's Slider: a Track with a Range, and a Thumb) ----
+     A real <input type=range> next to a number box that holds the value,
+     so the form still reads a plain .value off one element. The filled
+     Range is a hard-stopped gradient at --pct, which the script sets from
+     the box -- ::-moz-range-progress does it natively but only in
+     Firefox. */
+  .slider { display: flex; align-items: center; gap: .55rem; flex: 1 1 auto; min-width: 0; }
+  /* Typable, not just a readout: the track is for sweeping and the box is
+     for the value you already know. Spinners off -- the track is the
+     nudge-by-a-step control, and they'd eat half the box's width. */
+  .slider > .slider-num {
+    flex: 0 0 3.1rem; width: auto; min-width: 0;
+    padding: .25rem .35rem; border-radius: 7px; text-align: right;
+    font-variant-numeric: tabular-nums;
+    appearance: textfield; -moz-appearance: textfield;
+  }
+  .slider > .slider-num::-webkit-outer-spin-button,
+  .slider > .slider-num::-webkit-inner-spin-button {
+    -webkit-appearance: none; margin: 0;
+  }
+  .slider > input[type=range] {
+    appearance: none; -webkit-appearance: none;
+    flex: 1 1 auto; min-width: 0; width: auto; height: 1.1rem;
+    margin: 0; padding: 0; background: none; border: 0; cursor: pointer;
+  }
+  .slider > input[type=range]::-webkit-slider-runnable-track {
+    height: .3rem; border-radius: 999px;
+    background: linear-gradient(to right,
+      var(--accent) 0 var(--pct, 0%), var(--btn-line) var(--pct, 0%) 100%);
+  }
+  .slider > input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: .8rem; height: .8rem; margin-top: -.25rem;
+    border-radius: 50%; background: #fff; border: 1px solid var(--accent);
+    box-shadow: 0 1px 3px rgba(0,0,0,.3);
+  }
+  .slider > input[type=range]::-moz-range-track {
+    height: .3rem; border-radius: 999px; background: var(--btn-line);
+  }
+  .slider > input[type=range]::-moz-range-progress {
+    height: .3rem; border-radius: 999px; background: var(--accent);
+  }
+  .slider > input[type=range]::-moz-range-thumb {
+    width: .8rem; height: .8rem; border-radius: 50%;
+    background: #fff; border: 1px solid var(--accent);
+  }
+  .slider > input[type=range]:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 999px;
+  }
+
   .row { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; }
+
+  /* ---- field groups and card footers (Chakra's Field.Root and
+     Card.Footer) ----
+     A label stacked directly over its input, and the actions gathered at
+     the bottom right behind a divider. This is the shape for a form you
+     fill in once: the five setup steps and the Advanced credentials block.
+     The .fld rows in the Appearance and Layout tabs are deliberately the
+     opposite arrangement -- a settings form is twenty short values and
+     reads better as two aligned columns, where a form you fill in once
+     reads better as a stack. */
+  .fields { display: flex; flex-direction: column; gap: .95rem; }
+  .field { display: flex; flex-direction: column; gap: .3rem; }
+  .field > label { margin: 0; font-size: .82rem; color: var(--dim); }
+  .field > .sub2 { color: var(--faint); font-size: .78rem; }
+
+  .foot {
+    display: flex; justify-content: flex-end; align-items: center;
+    gap: .6rem; flex-wrap: wrap;
+    margin-top: 1.3rem; padding-top: 1rem; border-top: 1px solid var(--line);
+  }
+  .foot > button { margin-top: 0; }
+  /* The result of pressing the button belongs beside it, not stranded
+     under it -- and taking the left end of the row is also what keeps the
+     buttons at their end once there's something to say. */
+  .foot > .msg { margin: 0 auto 0 0; text-align: left; }
   .msg { margin-top: .9rem; font-size: .89rem; }
   .msg.bad { color: var(--bad); }
   .msg.ok { color: var(--ok); }
@@ -1010,17 +1485,44 @@ PAGE = r"""<!doctype html>
   a { color: var(--accent); }
   .check { display: flex; align-items: center; gap: .55rem; margin-top: 1rem;
            color: var(--dim); font-size: .9rem; }
-  .check input { width: auto; }
+  /* Left alone deliberately: the base rule's reserved strip is what keeps
+     the label off this box's shadow. */
   footer { color: var(--faint); font-size: .82rem; text-align: center; margin-top: 1.5rem; }
 
   /* ---- management tabs ---- */
-  nav.tabs { display: flex; gap: .3rem; margin: 0 0 1rem; border-bottom: 1px solid var(--line); }
+  /* The outline variant: the list carries one continuous rule and each tab
+     is an outlined shape sitting astride it, so the active one reads as a
+     folder tab merging into the panel below. The -1px pulls the tabs down
+     onto that rule; the active tab's own fill then hides the span of it
+     underneath, which is what joins tab to content. */
+  nav.tabs { display: flex; gap: .2rem; margin: 0 0 1rem; border-bottom: 1px solid var(--line); }
   nav.tabs[hidden] { display: none; }
+  /* Tabs happen to be <button>s for the keyboard, not to look like one --
+     hence the explicit climb back out of the base button's fill and radius. */
   .tab {
-    margin: 0; padding: .55rem .95rem; border-radius: 8px 8px 0 0; background: transparent;
-    color: var(--dim); font-weight: 500; border-bottom: 2px solid transparent;
+    /* No shadow transition, unlike every other button: selecting a tab is
+       a jump from one panel to another, and a shadow easing in behind the
+       new tab reads as the page still settling after you have already
+       moved. The base button rule's 0.45s is dropped here. */
+    transition: background .12s ease, border-color .12s ease;
+    margin: 0 0 -1px; padding: .45rem .8rem; border-radius: 8px 8px 0 0;
+    background: transparent; color: var(--dim); font-size: .92rem; font-weight: 500;
+    border: 1px solid transparent; gap: .4rem;
   }
-  .tab.on { color: var(--text); background: var(--card); border-bottom-color: var(--accent); }
+  .tab > svg { width: .95em; height: .95em; flex: none; }
+  .tab:hover:not(.on) { background: var(--card-2); color: var(--text); }
+  .tab.on {
+    color: var(--text); background: var(--card);
+    border-color: var(--line); border-bottom-color: transparent;
+    /* Down and to the right like everything else, and cut off at the
+       rule the tab sits on rather than allowed to cross it: the active
+       tab's bottom edge is missing so it merges into the panel below, and
+       a shadow running past that line would paint the seam back in as a
+       dark bar. The inset clips the bottom at the tab's own edge while the
+       negative sides leave the sideways reach alone. */
+    box-shadow: var(--ui-shadow-tab) var(--ui-shadow-tab) var(--ui-shadow-color);
+    clip-path: inset(-50px -50px 0 -50px);
+  }
   h3.grp {
     font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--faint);
     margin: 1.7rem 0 .2rem; padding-bottom: .35rem; border-bottom: 1px solid var(--line);
@@ -1037,46 +1539,126 @@ PAGE = r"""<!doctype html>
   }
   .fld > .lbl { flex: 1 1 auto; font-size: .9rem; }
   .fld > .lbl .sub2 { display: block; color: var(--faint); font-size: .78rem; }
-  .fld > .ctl { flex: 0 0 11rem; display: flex; align-items: center; gap: .4rem; }
-  .fld input[type=text], .fld input[type=number], .fld select { width: 100%; padding: .4rem .5rem; }
+  /* One width for every row's control column, so the boxes line up on
+     their left edge as well as their right. A picker or a slider gets no
+     extra room: widening those rows was what pushed the accent box and
+     the opacity track out past the plain number boxes under them. */
+  /* The strip on the right is the room the controls' shadows need. Taken
+     on the column rather than on each control, so every one of them --
+     number box, select, color well, checkbox -- keeps the same indent and
+     they all still end on one line. */
+  .fld > .ctl { flex: 0 0 10.5rem; display: flex; align-items: center;
+                justify-content: flex-end; gap: .4rem;
+                padding-right: var(--ui-shadow-input); }
+  /* The same box at form-row scale: a 10px radius on a 1.8rem-tall
+     control reads as a pill, so the compact ones take a tighter one. */
+  .fld input[type=text], .fld input[type=number], .fld select {
+    width: 100%; padding: .32rem .45rem; border-radius: 7px;
+  }
+  /* Right-aligned like the numbers beside them: in a form of label-left,
+     control-right rows, every value on the page starts at the same edge,
+     and an accent hex or a section title that read from the left was the
+     odd one out. The wizard's own full-width boxes are untouched -- a
+     client_id typed from the right edge would be unreadable. */
+  .fld input[type=text] { text-align: right; }
   .fld input[type=color] {
     width: 2.6rem; height: 2rem; padding: 0; background: var(--bg);
     border: 1px solid var(--line); border-radius: 6px;
+    --ui-shadow-self: var(--ui-shadow-input);
+    box-shadow: var(--ui-shadow-self) var(--ui-shadow-self) var(--ui-shadow-color);
   }
-  .fld input[type=checkbox] { width: auto; margin: 0 auto 0 0; }
+  .fld input[type=color]:focus { animation: ui-shadow-settle .45s ease-out forwards; }
+  /* Right-indented, not left: the control column's other occupants (the
+     number boxes, the selects, the color swatch) all end at its right
+     edge, and a checkbox parked at the left edge was the one control in
+     the form that didn't line up with anything. margin-left: auto pushes
+     it over to join them. */
+  /* No right margin of its own here: the column above already reserved
+     the strip, and taking it twice would break the one line they share. */
+  .fld input[type=checkbox] { margin: 0 0 var(--ui-shadow-check) auto; }
   .fld.off { opacity: .42; }
   .unit { color: var(--faint); font-size: .8rem; }
   .badge {
     font-size: .68rem; text-transform: uppercase; letter-spacing: .04em; color: var(--faint);
     border: 1px solid var(--line); border-radius: 999px; padding: .05rem .4rem; margin-left: .4rem;
   }
-  /* Destructive on the left, the two you actually reach for on the right,
+  /* Destructive on the left, the one you actually reach for on the right,
      so Restore to Default isn't sitting under the cursor that just pressed
      Save. */
   .acts { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center;
           margin-top: 1.4rem; padding-top: 1.1rem; border-top: 1px solid var(--line); }
   .acts button { margin-top: 0; }
   .acts .right { margin-left: auto; display: flex; gap: .6rem; flex-wrap: wrap; }
-  ul.accts { list-style: none; padding: 0; margin: .3rem 0 0; }
-  ul.accts li {
-    display: flex; justify-content: space-between; align-items: center; gap: 1rem;
-    padding: .4rem .7rem; background: var(--card-2); border-radius: 8px;
-    margin-bottom: .3rem; font-size: .9rem;
+  /* A table, so the tick, the bank and the account line up down the page
+     instead of every row laying itself out between two flex ends. Separate
+     borders with a row gap rather than collapse: a collapsed table can't
+     round its cells, and these rows want the same pill shape the bank list
+     above them has. No column headers -- three columns of one word each
+     don't need titling, and the section heading already says what the
+     block is. */
+  table.accts {
+    width: 100%; margin: .3rem 0 .2rem; font-size: .9rem;
+    border-collapse: separate; border-spacing: 0 .3rem;
   }
-  /* The whole left side is the checkbox's label, so the bank name is a
-     click target rather than a 13px box being the only way to toggle. */
-  ul.accts .who {
-    display: flex; align-items: center; gap: .55rem; margin: 0;
-    color: var(--text); font-size: .9rem; cursor: pointer;
+  table.accts td {
+    background: var(--card-2); padding: .38rem .6rem; vertical-align: middle;
   }
-  ul.accts .who input { width: auto; margin: 0; cursor: pointer; }
-  ul.accts .what { color: var(--dim); text-align: right; }
-  ul.accts .num4 { font-variant-numeric: tabular-nums; color: var(--faint); }
+  /* Raised like the layout rows, and flattening the same way when the row
+     is picked: there the trigger is the drag, here it is the row's own
+     tick, which is the only "selected" an account row has. The shadow goes
+     on the cells rather than the <tr> because a row in a separate-border
+     table has no box of its own to cast one. */
+  table.accts tr > td {
+    --ui-shadow-self: var(--ui-shadow-row);
+    box-shadow: var(--ui-shadow-self) var(--ui-shadow-self) var(--ui-shadow-color);
+  }
+  /* The middle cells would otherwise cast onto their own neighbours, so
+     only the last one in the row reaches sideways; the rest cast straight
+     down, which is the part of the row edge they actually own. */
+  table.accts tr > td:not(:last-child) {
+    box-shadow: 0 var(--ui-shadow-self) var(--ui-shadow-color);
+  }
+  table.accts tr[data-selected] > td {
+    animation: ui-shadow-settle .45s ease-out forwards;
+  }
+  table.accts tr[data-selected] > td:not(:last-child) {
+    animation: ui-shadow-settle-down .45s ease-out forwards;
+  }
+  @keyframes ui-shadow-settle-down {
+    from { box-shadow: 0 var(--ui-shadow-self) var(--ui-shadow-color); }
+    to   { box-shadow: 0 0 var(--ui-shadow-color); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    table.accts tr[data-selected] > td { animation: none; box-shadow: none; }
+  }
+  table.accts td:first-child {
+    width: 1px; padding-right: 0; border-radius: 8px 0 0 8px;
+  }
+  table.accts td:last-child { border-radius: 0 8px 8px 0; }
+  table.accts td:first-child input { display: block; }
+  /* The bank name is the row's checkbox label, so it's a click target too
+     rather than a 17px box being the only way to toggle the row. */
+  table.accts .who label { display: block; margin: 0; font-size: inherit;
+                           color: var(--text); cursor: pointer; }
+  table.accts .what { color: var(--dim); text-align: right; white-space: nowrap; }
+  table.accts .num4 { font-variant-numeric: tabular-nums; color: var(--faint); }
   /* Still listed, visibly not drawn: removing the row would make hiding an
-     account look like unlinking the bank. */
-  ul.accts li.hiddenAcct { opacity: .45; }
-  ul.accts li.hiddenAcct .what::after { content: ' (hidden)'; color: var(--faint); }
-  ul.accts .none { color: var(--faint); background: none; padding-left: 0; }
+     account look like unlinking the bank. Keyed off data-selected, which
+     is the one thing the row's own checkbox sets. */
+  table.accts tr:not([data-selected]) { opacity: .45; }
+  table.accts tr:not([data-selected]) .what::after { content: ' (hidden)'; color: var(--faint); }
+
+  /* Select-all sits in the section heading: the rows have no column
+     headers for it to live in, and the heading is already the element that
+     spans the group. */
+  h3.grp > .pickall {
+    display: flex; align-items: center; gap: .5rem; margin: 0;
+    font: inherit; color: inherit; letter-spacing: inherit; cursor: pointer;
+  }
+  h3.grp > .pickall > .count {
+    margin-left: auto; color: var(--faint);
+    text-transform: none; letter-spacing: 0;
+  }
   ol.order { color: var(--dim); font-size: .86rem; margin: .3rem 0 0; padding-left: 1.4rem; }
   ol.order code { color: var(--text); }
 
@@ -1086,8 +1668,19 @@ PAGE = r"""<!doctype html>
     display: flex; align-items: center; gap: .6rem; padding: .5rem .7rem;
     background: var(--card-2); border: 1px solid transparent; border-radius: 8px;
     margin-bottom: .35rem; font-size: .9rem; cursor: grab;
+    --ui-shadow-self: var(--ui-shadow-row);
+    box-shadow: var(--ui-shadow-self) var(--ui-shadow-self) var(--ui-shadow-color);
   }
-  ul.sortable li.dragging { opacity: .4; }
+  /* Every row sits raised, and the one you pick up is the one that drops:
+     its distance closes to nothing as you move it, so the card you are
+     carrying is the only flat thing in the list. */
+  ul.sortable li.dragging {
+    opacity: .4;
+    animation: ui-shadow-settle .45s ease-out forwards;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    ul.sortable li.dragging { animation: none; box-shadow: none; }
+  }
   /* The gap opens where the card would land, rather than a line that has to
      be read as "above" or "below" something. */
   ul.sortable li.dropAbove { border-top-color: var(--accent); }
@@ -1112,43 +1705,61 @@ PAGE = r"""<!doctype html>
   <p class="sub" id="subtitle">Setting things up.</p>
 
   <!-- ===================================================== manage view -->
-  <nav class="tabs" id="tabs" hidden>
-    <button class="tab on" data-tab="accounts">Accounts</button>
-    <button class="tab" data-tab="layout">Layout</button>
-    <button class="tab" data-tab="appearance">Appearance</button>
+  <nav class="tabs" id="tabs" role="tablist" hidden>
+    <button class="tab on" data-tab="accounts" role="tab" aria-selected="true" aria-controls="tab-accounts">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10h18M3 10l9-6 9 6M5 10v10h14V10"/></svg>
+      Accounts
+    </button>
+    <button class="tab" data-tab="layout" role="tab" aria-selected="false" aria-controls="tab-layout">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4h18v16H3z"/><path d="M3 10h18M10 10v10"/></svg>
+      Layout
+    </button>
+    <button class="tab" data-tab="appearance" role="tab" aria-selected="false" aria-controls="tab-appearance">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>
+      Appearance
+    </button>
   </nav>
 
   <section id="tab-accounts" hidden>
     <h2><span class="num">&#10003;</span> Linked banks</h2>
     <p class="hint">
-      Add another bank, or remove one. Removing one drops its access token
-      here but leaves the bank linked at Plaid, so re-adding it later costs
-      nothing.
+      Add another bank, or remove one. Removing one forgets it here but
+      leaves the bank linked at Plaid, so adding it back later is just
+      another sign-in. The account list is what the last fetch returned,
+      grouped into the sections the widget draws them in; new banks join it
+      after the next refresh.
     </p>
     <div class="body">
-      <ul class="banks" id="bankList"></ul>
-      <div class="row">
-        <button id="addBank">Add a bank</button>
-        <button class="ghost" id="reinstall">Redo shortcuts</button>
-        <button class="ghost" id="launchNow">Launch widget</button>
+      <div class="split">
+        <div>
+          <ul class="banks" id="bankList"></ul>
+          <div class="row">
+            <button class="solid" id="addBank">Add a bank</button>
+            <button id="reinstall">Redo shortcuts</button>
+            <button id="launchNow">Launch widget</button>
+          </div>
+          <p class="hint" id="notInstalled" hidden style="margin:.9rem 0 0">
+            Not installed yet, so there's no Start-menu shortcut either.
+            Launching or redoing shortcuts creates both.
+          </p>
+          <div class="check">
+            <input type="checkbox" id="autostartManage">
+            <label for="autostartManage" style="margin:0">Start with Windows</label>
+          </div>
+          <div class="msg" id="manageMsg"></div>
+        </div>
+        <div>
+          <h3 class="grp" style="margin-top:0">Accounts on the widget</h3>
+          <p class="hint2">
+            Untick one to leave it off the widget &ndash; it stays linked,
+            it just isn't drawn.
+          </p>
+          <div id="groups"></div>
+        </div>
       </div>
-      <p class="hint" id="notInstalled" hidden style="margin:.9rem 0 0">
-        Not installed yet &ndash; there's no Start-menu shortcut. Launching
-        or redoing shortcuts will create one.
-      </p>
-      <div class="check">
-        <input type="checkbox" id="autostartManage">
-        <label for="autostartManage" style="margin:0">Start with Windows</label>
-      </div>
-      <div class="msg" id="manageMsg"></div>
-
-      <h3 class="grp">Accounts on the widget</h3>
-      <p class="hint2">
-        What the last fetch returned, in the sections the widget draws them
-        in. Untick one to leave it off the widget &ndash; it stays linked, it
-        just isn't drawn. New banks show up here after the next refresh.
-      </p>
-      <div id="groups"></div>
 
       <h3 class="grp">Advanced</h3>
       <div class="check" style="margin-top:.3rem">
@@ -1162,32 +1773,39 @@ PAGE = r"""<!doctype html>
           under the old ones would error on every fetch instead of carrying
           over. You'll re-link them from this tab afterwards.
         </p>
-        <div class="fld">
-          <span class="lbl">Environment</span>
-          <span class="ctl">
-            <select id="advEnv">
-              <option value="production">production</option>
-              <option value="sandbox">sandbox</option>
-            </select>
-          </span>
+        <!-- The same three credentials as step 1, so the same stacked
+             shape: this is a form you fill in, not a row of settings you
+             scan. -->
+        <div class="narrow">
+          <div class="fields">
+            <div class="field">
+              <label for="advEnv">Environment</label>
+              <select id="advEnv">
+                <option value="production">production</option>
+                <option value="sandbox">sandbox</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="advClientId">Client ID</label>
+              <input type="text" id="advClientId" autocomplete="off" spellcheck="false">
+              <span class="sub2">Leave blank to keep the saved one</span>
+            </div>
+            <div class="field">
+              <label for="advSecret">Secret</label>
+              <input type="password" id="advSecret" autocomplete="off" spellcheck="false">
+              <span class="sub2">Leave blank to keep the saved one</span>
+            </div>
+          </div>
+          <p class="hint2">
+            These start blank on purpose: setup never sends your saved
+            credentials back to the page, so they can't end up in a browser
+            cache or a screenshot.
+          </p>
+          <div class="foot">
+            <div class="msg" id="advMsg"></div>
+            <button class="solid" id="saveAdvanced">Save and unlink banks</button>
+          </div>
         </div>
-        <div class="fld">
-          <span class="lbl">Client ID<span class="sub2">Leave blank to keep the saved one</span></span>
-          <span class="ctl"><input type="text" id="advClientId" autocomplete="off" spellcheck="false"></span>
-        </div>
-        <div class="fld">
-          <span class="lbl">Secret<span class="sub2">Leave blank to keep the saved one</span></span>
-          <span class="ctl"><input type="password" id="advSecret" autocomplete="off" spellcheck="false"></span>
-        </div>
-        <p class="hint2">
-          These start blank on purpose: setup never sends your saved
-          credentials back to the page, so they can't end up in a browser
-          cache or a screenshot.
-        </p>
-        <div class="acts">
-          <button id="saveAdvanced">Save and unlink banks</button>
-        </div>
-        <div class="msg" id="advMsg"></div>
       </div>
     </div>
   </section>
@@ -1197,15 +1815,22 @@ PAGE = r"""<!doctype html>
     <p class="hint">
       Drag a card to move it. Each section is its own list &ndash; which
       section a card lands in comes from the account type, not a preference,
-      and the widget draws the two kinds differently. Drops save straight
-      away.
+      and the widget draws the two kinds differently. Everything on this tab
+      saves as soon as you change it. What each section is called and when
+      it breaks a card onto its own row are on the left.
     </p>
     <div class="body">
-      <div id="layoutSections"></div>
+      <!-- Settings left, cards right: the lists are the thing you came
+           here to drag, so they get a column to themselves rather than
+           three text fields interleaved between them. -->
+      <div class="split">
+        <div id="layoutRules"></div>
+        <div id="layoutSections"></div>
+      </div>
       <div class="acts">
-        <button class="ghost" id="undoLayout" disabled>Undo last move</button>
+        <button id="undoLayout" disabled>Undo last move</button>
         <span class="right">
-          <button class="ghost" id="restartLayout">Restart Widget</button>
+          <button id="restartLayout">Restart Widget</button>
         </span>
       </div>
       <div class="msg" id="layoutMsg"></div>
@@ -1215,18 +1840,34 @@ PAGE = r"""<!doctype html>
   <section id="tab-appearance" hidden>
     <h2>Appearance</h2>
     <p class="hint">
-      Everything in <code>appearance.json</code>, in the order it appears
-      there. Most of it takes effect the next time the widget's page loads;
+      The widget's settings from <code>appearance.json</code>, in the order
+      they appear there &ndash; card order and section headings are on the
+      Layout tab instead. Most of it takes effect the next time the
+      widget's page loads;
       anything marked <span class="badge">restart</span> is read once at
-      launch, so it needs the widget restarted.
+      launch, so save it with <em>Save and Restart</em> from the arrow next
+      to Save.
     </p>
     <div class="body">
-      <div id="appearanceForm"></div>
+      <div class="cols" id="appearanceForm"></div>
       <div class="acts">
-        <button class="ghost" id="restoreAppearance">Restore to Default</button>
+        <button id="restoreAppearance">Restore to Default</button>
         <span class="right">
-          <button id="saveAppearance">Save</button>
-          <button class="ghost" id="restartWidget">Restart Widget</button>
+          <span class="menu-root">
+            <span class="btn-group">
+              <button class="solid" id="saveAppearance">Save</button>
+              <button class="solid" id="saveMenuBtn" aria-haspopup="menu"
+                      aria-expanded="false" aria-label="More save options">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="m6 9 6 6 6-6"/>
+                </svg>
+              </button>
+            </span>
+            <div class="menu" id="saveMenu" role="menu" hidden>
+              <button role="menuitem" id="saveRestart">Save and Restart</button>
+            </div>
+          </span>
         </span>
       </div>
       <div class="msg" id="appearanceMsg"></div>
@@ -1243,17 +1884,27 @@ PAGE = r"""<!doctype html>
       then copy the client ID and secret from the dashboard's Keys page.
     </p>
     <div class="body">
-      <label for="clientId">Client ID</label>
-      <input type="text" id="clientId" autocomplete="off" spellcheck="false">
-      <label for="secret">Secret</label>
-      <input type="password" id="secret" autocomplete="off" spellcheck="false">
-      <label for="environment">Environment</label>
-      <select id="environment">
-        <option value="production">production &ndash; your real accounts</option>
-        <option value="sandbox">sandbox &ndash; Plaid's fake test bank</option>
-      </select>
-      <button id="saveCreds">Check and save</button>
-      <div class="msg" id="credsMsg"></div>
+      <div class="fields">
+        <div class="field">
+          <label for="clientId">Client ID</label>
+          <input type="text" id="clientId" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="secret">Secret</label>
+          <input type="password" id="secret" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="environment">Environment</label>
+          <select id="environment">
+            <option value="production">production &ndash; your real accounts</option>
+            <option value="sandbox">sandbox &ndash; Plaid's fake test bank</option>
+          </select>
+        </div>
+      </div>
+      <div class="foot">
+        <div class="msg" id="credsMsg"></div>
+        <button class="solid" id="saveCreds">Check and save</button>
+      </div>
     </div>
   </section>
 
@@ -1261,16 +1912,17 @@ PAGE = r"""<!doctype html>
   <section id="s2" hidden>
     <h2><span class="num">2</span> Link a bank</h2>
     <p class="hint">
-      Opens Plaid's own login window. You sign in to your bank directly &ndash;
-      your bank password never passes through DesktopCards.
+      Opens Plaid's own login screen over this page. You sign in to your
+      bank directly &ndash; your bank password never passes through
+      DesktopCards.
     </p>
     <div class="body">
       <ul class="banks" id="linkedSoFar"></ul>
-      <div class="row">
-        <button id="startLink">Open Plaid Link</button>
-        <button class="ghost" id="doneLinking" hidden>Done adding banks</button>
+      <div class="foot">
+        <div class="msg" id="linkMsg"></div>
+        <button id="doneLinking" hidden>Done adding banks</button>
+        <button class="solid" id="startLink">Open Plaid Link</button>
       </div>
-      <div class="msg" id="linkMsg"></div>
     </div>
   </section>
 
@@ -1282,8 +1934,10 @@ PAGE = r"""<!doctype html>
       than as an empty widget later.
     </p>
     <div class="body">
-      <button id="verify">Fetch my balances</button>
-      <div class="msg" id="verifyMsg"></div>
+      <div class="foot">
+        <div class="msg" id="verifyMsg"></div>
+        <button class="solid" id="verify">Fetch my balances</button>
+      </div>
     </div>
   </section>
 
@@ -1299,8 +1953,10 @@ PAGE = r"""<!doctype html>
         <input type="checkbox" id="autostart" checked>
         <label for="autostart" style="margin:0">Also start it with Windows</label>
       </div>
-      <button id="install">Install</button>
-      <div class="msg" id="installMsg"></div>
+      <div class="foot">
+        <div class="msg" id="installMsg"></div>
+        <button class="solid" id="install">Install</button>
+      </div>
     </div>
   </section>
 
@@ -1312,11 +1968,11 @@ PAGE = r"""<!doctype html>
         The widget sits on your desktop and survives Win+D. Everything else
         lives in its system tray icon &ndash; reload, restart, add accounts, quit.
       </p>
-      <div class="row">
-        <button id="launch">Launch DesktopCards</button>
-        <button class="ghost" id="quit">Close setup</button>
+      <div class="foot">
+        <div class="msg" id="doneMsg"></div>
+        <button id="quit">Close setup</button>
+        <button class="solid" id="launch">Launch DesktopCards</button>
       </div>
-      <div class="msg" id="doneMsg"></div>
     </div>
   </section>
 
@@ -1326,6 +1982,67 @@ PAGE = r"""<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 let STATE = {};
+
+// ------------------------------------------------------- button loading
+// A button that kicks off a request says so on itself, rather than only in
+// the .msg line below the section -- the message is easy to miss, and the
+// three slow operations here (saving, restarting the widget, rewriting the
+// shortcuts) all look like nothing happened until they finish.
+//
+// The label is stashed on the element so a second loading() for the next
+// stage of the same operation (Save, then Restart) doesn't lose the resting
+// one, and so loaded() can restore it from any error path. disabled is set
+// here too, so no handler has to remember to do both.
+function loading(btn, text) {
+  if (!btn) return;
+  if (btn.dataset.label === undefined) btn.dataset.label = btn.textContent;
+  if (text) btn.textContent = text;
+  btn.classList.add('loading');
+  btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
+}
+
+// Set a button's resting label, whether or not it's currently showing a
+// loading one: while it is, the new label goes to the stash that loaded()
+// will restore from instead of to the button.
+function relabel(btn, text) {
+  if (!btn) return;
+  if (btn.dataset.label !== undefined) btn.dataset.label = text;
+  else btn.textContent = text;
+}
+
+function loaded(btn) {
+  if (!btn) return;
+  if (btn.dataset.label !== undefined) {
+    btn.textContent = btn.dataset.label;
+    delete btn.dataset.label;
+  }
+  btn.classList.remove('loading');
+  btn.disabled = false;
+  btn.removeAttribute('aria-busy');
+}
+
+// ---------------------------------------------------------- menu plumbing
+// One dropdown on the page (Save), so this is the whole of it: a trigger
+// that toggles its menu, and a menu that closes on a click anywhere else
+// or on Escape. A click on an item bubbles up to the menu and closes it,
+// so the menu isn't left hanging open over the button it just started.
+function wireMenu(triggerId, menuId) {
+  const trigger = $(triggerId), menu = $(menuId);
+  if (!trigger || !menu) return;
+  const open = on => {
+    menu.hidden = !on;
+    trigger.setAttribute('aria-expanded', on ? 'true' : 'false');
+  };
+  trigger.onclick = e => { e.stopPropagation(); open(menu.hidden); };
+  menu.onclick = () => open(false);
+  document.addEventListener('click', e => {
+    if (!menu.hidden && !menu.contains(e.target)) open(false);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !menu.hidden) { open(false); trigger.focus(); }
+  });
+}
 
 // ---------------------------------------------------- keeping the server
 // This page is the only reason its server exists, so the server should go
@@ -1443,31 +2160,68 @@ function renderGroups(groups) {
     return;
   }
   for (const g of nonEmpty) {
+    // "other" has no order or hidden list behind it in appearance.json, so
+    // there's nothing for a toggle in this section to write into.
+    const locked = g.type === 'other';
+    const rows = [];
+
     const h = document.createElement('h3');
     h.className = 'grp';
     h.style.marginTop = '1rem';
-    h.textContent = SECTION_LABELS[g.type] || g.type;
-    host.append(h);
-    const ul = document.createElement('ul');
-    ul.className = 'accts';
-    for (const a of g.accounts) {
-      const li = document.createElement('li');
-      li.classList.toggle('hiddenAcct', !!a.hidden);
 
-      const left = document.createElement('label');
-      left.className = 'who';
+    const all = document.createElement('input');
+    all.type = 'checkbox';
+    all.disabled = locked;
+    all.setAttribute('aria-label', 'Show every account in this section');
+
+    const count = document.createElement('span');
+    count.className = 'count';
+
+    const head = document.createElement('label');
+    head.className = 'pickall';
+    head.append(all, document.createTextNode(SECTION_LABELS[g.type] || g.type), count);
+    h.append(head);
+    host.append(h);
+
+    // The header box and the count are derived from the rows every time
+    // rather than tracked alongside them, so a failed request that rolls
+    // one row back can't leave them disagreeing with it. indeterminate is
+    // the partial state the <input> already knows how to draw.
+    const syncHead = () => {
+      const on = rows.filter(r => r.box.checked).length;
+      all.checked = on === rows.length;
+      all.indeterminate = on > 0 && on < rows.length;
+      count.textContent = on + ' of ' + rows.length + ' shown';
+    };
+
+    const table = document.createElement('table');
+    table.className = 'accts';
+    const tbody = document.createElement('tbody');
+
+    for (const a of g.accounts) {
+      const tr = document.createElement('tr');
+
       const box = document.createElement('input');
       box.type = 'checkbox';
+      // Needed as a label target, since a <label> can't wrap two cells the
+      // way it wrapped the old single-row layout.
+      box.id = 'acct:' + g.type + ':' + a.key;
       box.checked = !a.hidden;
-      // "other" has no order or hidden list behind it in appearance.json,
-      // so there's nothing to write a toggle into.
-      box.disabled = g.type === 'other';
+      box.disabled = locked;
+      // Present means the widget draws it -- the row styling keys off this
+      // one attribute rather than a class of its own.
+      const mark = () => tr.toggleAttribute('data-selected', box.checked);
+      mark();
+
+      const row = { box: box, acct: a, mark: mark };
+      rows.push(row);
+
       box.onchange = async () => {
         box.disabled = true;
         try {
           await api('/api/visibility', { key: a.key, type: g.type, visible: box.checked });
           a.hidden = !box.checked;
-          li.classList.toggle('hiddenAcct', !box.checked);
+          mark();
           say($('manageMsg'),
             (box.checked ? 'Showing ' : 'Hiding ') + a.institution_name +
             '. The widget picks that up on its next refresh.', 'ok');
@@ -1477,24 +2231,70 @@ function renderGroups(groups) {
           box.checked = !box.checked;
           say($('manageMsg'), e.message, 'bad');
         }
-        box.disabled = g.type === 'other';
+        box.disabled = locked;
+        syncHead();
       };
-      left.append(box, document.createTextNode(a.institution_name));
 
-      const right = document.createElement('span');
-      right.className = 'what';
-      right.innerHTML = a.name + (a.mask ? ' <span class="num4">&bull;&bull;' + a.mask + '</span>' : '');
+      const pick = document.createElement('td');
+      pick.append(box);
 
-      li.append(left, right);
-      ul.append(li);
+      const who = document.createElement('td');
+      who.className = 'who';
+      const lab = document.createElement('label');
+      lab.setAttribute('for', box.id);
+      lab.textContent = a.institution_name;
+      who.append(lab);
+
+      const what = document.createElement('td');
+      what.className = 'what';
+      what.innerHTML = a.name + (a.mask ? ' <span class="num4">&bull;&bull;' + a.mask + '</span>' : '');
+
+      tr.append(pick, who, what);
+      tbody.append(tr);
     }
-    host.append(ul);
+
+    // One request per account, in sequence: /api/visibility writes a single
+    // key at a time, and stopping at the first failure with the rows that
+    // did land left alone beats guessing which half of a section applied.
+    all.onchange = async () => {
+      const want = all.checked;
+      const changing = rows.filter(r => r.box.checked !== want);
+      if (!changing.length) { syncHead(); return; }
+      for (const r of rows) r.box.disabled = true;
+      all.disabled = true;
+      let done = 0, failed = null;
+      for (const r of changing) {
+        try {
+          await api('/api/visibility', { key: r.acct.key, type: g.type, visible: want });
+          r.acct.hidden = !want;
+          r.box.checked = want;
+          r.mark();
+          done++;
+        } catch (e) { failed = e; break; }
+      }
+      for (const r of rows) r.box.disabled = locked;
+      all.disabled = locked;
+      syncHead();
+      if (failed) {
+        say($('manageMsg'), failed.message, 'bad');
+      } else {
+        say($('manageMsg'), (want ? 'Showing ' : 'Hiding ') + done + ' account' +
+          (done === 1 ? '' : 's') + '. The widget picks that up on its next refresh.', 'ok');
+        APPEARANCE = null;
+      }
+    };
+
+    syncHead();
+    table.append(tbody);
+    host.append(table);
   }
 }
 
 function showTab(name) {
   for (const btn of document.querySelectorAll('.tab')) {
-    btn.classList.toggle('on', btn.dataset.tab === name);
+    const on = btn.dataset.tab === name;
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
   }
   $('tab-accounts').hidden = name !== 'accounts';
   $('tab-layout').hidden = name !== 'layout';
@@ -1526,6 +2326,7 @@ async function loadState() {
   $('where').textContent = 'Settings and data: ' + STATE.data_dir;
   if (STATE.configured) {
     $('subtitle').textContent = 'Already set up. Change what you need.';
+    document.querySelector('main').classList.add('manage');
     $('tabs').hidden = false;
     for (const s of ['s1','s2','s3','s4','s5']) step(s, 'hidden');
     showTab(document.querySelector('.tab.on').dataset.tab);
@@ -1536,6 +2337,7 @@ async function loadState() {
     renderGroups(STATE.groups);
   } else {
     $('subtitle').textContent = 'Five steps, about two minutes.';
+    document.querySelector('main').classList.remove('manage');
     $('tabs').hidden = true;
     $('tab-accounts').hidden = true;
     $('tab-layout').hidden = true;
@@ -1544,14 +2346,17 @@ async function loadState() {
 
   // Say what the button will actually do. Pressing it while a widget is
   // running restarts that one rather than starting a second.
-  $('launchNow').textContent = STATE.running ? 'Restart widget' : 'Launch widget';
-  $('launch').textContent = STATE.running ? 'Restart DesktopCards' : 'Launch DesktopCards';
+  // relabel(), not textContent: a loadState() that lands while one of
+  // these is mid-restart would otherwise write over the spinner's
+  // "Restarting…" and then have loaded() put the stale old label back.
+  relabel($('launchNow'), STATE.running ? 'Restart widget' : 'Launch widget');
+  relabel($('launch'), STATE.running ? 'Restart DesktopCards' : 'Launch DesktopCards');
 }
 
 // ---------------------------------------------------------------- step 1
 $('saveCreds').onclick = async () => {
   const btn = $('saveCreds');
-  btn.disabled = true;
+  loading(btn, 'Checking…');
   say($('credsMsg'), 'Checking with Plaid…');
   try {
     await api('/api/credentials', {
@@ -1566,7 +2371,7 @@ $('saveCreds').onclick = async () => {
   } catch (e) {
     say($('credsMsg'), e.message, 'bad');
   }
-  btn.disabled = false;
+  loaded(btn);
 };
 
 // ---------------------------------------------------------------- step 2
@@ -1621,7 +2426,7 @@ $('doneLinking').onclick = () => {
 // ---------------------------------------------------------------- step 3
 $('verify').onclick = async () => {
   const btn = $('verify');
-  btn.disabled = true;
+  loading(btn, 'Fetching…');
   say($('verifyMsg'), 'Asking your banks… this can take a few seconds.');
   try {
     const r = await api('/api/verify', {});
@@ -1632,13 +2437,13 @@ $('verify').onclick = async () => {
   } catch (e) {
     say($('verifyMsg'), e.message, 'bad');
   }
-  btn.disabled = false;
+  loaded(btn);
 };
 
 // ---------------------------------------------------------------- step 4
 $('install').onclick = async () => {
   const btn = $('install');
-  btn.disabled = true;
+  loading(btn, 'Installing…');
   say($('installMsg'), 'Installing…');
   try {
     const r = await api('/api/install', { autostart: $('autostart').checked });
@@ -1652,11 +2457,13 @@ $('install').onclick = async () => {
   } catch (e) {
     say($('installMsg'), e.message, 'bad');
   }
-  btn.disabled = false;
+  loaded(btn);
 };
 
 // ---------------------------------------------------------------- step 5
 $('launch').onclick = async () => {
+  const btn = $('launch');
+  loading(btn, STATE.running ? 'Restarting…' : 'Starting…');
   say($('doneMsg'), 'Starting…');
   try {
     const r = await api('/api/launch', {});
@@ -1664,6 +2471,7 @@ $('launch').onclick = async () => {
       ? 'Restarted the running widget.'
       : 'Launched. Look for the icon in your system tray.', 'ok');
   } catch (e) { say($('doneMsg'), e.message, 'bad'); }
+  loaded(btn);
 };
 $('quit').onclick = async () => {
   const btn = $('quit');
@@ -1687,14 +2495,21 @@ $('addBank').onclick = () => runLink($('manageMsg'), async () => {
   await loadState();
 });
 $('reinstall').onclick = async () => {
+  const btn = $('reinstall');
+  loading(btn, 'Writing shortcuts…');
   say($('manageMsg'), 'Writing shortcuts…');
   try {
     await api('/api/install', { autostart: $('autostartManage').checked });
     say($('manageMsg'), 'Shortcuts updated.', 'ok');
   } catch (e) { say($('manageMsg'), e.message, 'bad'); }
+  loaded(btn);
 };
-$('autostartManage').onchange = $('reinstall').onclick;
+// Same work, from the checkbox rather than the button -- so it spins the
+// button too, which is where the result shows up.
+$('autostartManage').onchange = () => $('reinstall').onclick();
 $('launchNow').onclick = async () => {
+  const btn = $('launchNow');
+  loading(btn, STATE.running ? 'Restarting…' : 'Starting…');
   say($('manageMsg'), 'Starting…');
   try {
     const r = await api('/api/launch', {});
@@ -1703,8 +2518,12 @@ $('launchNow').onclick = async () => {
       : 'Launched. Look for the icon in your system tray.', 'ok');
     // The restart takes a moment to come back up; re-read after it has, so
     // the button label reflects reality rather than the instant mid-restart.
-    setTimeout(loadState, 4000);
+    // The spinner stays up for that wait too: it's the same operation
+    // finishing, and loadState() is what retitles the button.
+    setTimeout(() => { loaded(btn); loadState(); }, 4000);
+    return;
   } catch (e) { say($('manageMsg'), e.message, 'bad'); }
+  loaded(btn);
 };
 
 // ------------------------------------------------------------- advanced
@@ -1718,7 +2537,7 @@ $('saveAdvanced').onclick = async () => {
     : 'Save these credentials?';
   if (!confirm(warning)) return;
   const btn = $('saveAdvanced');
-  btn.disabled = true;
+  loading(btn, 'Saving…');
   say($('advMsg'), 'Checking with Plaid…');
   try {
     await api('/api/credentials', {
@@ -1734,7 +2553,7 @@ $('saveAdvanced').onclick = async () => {
   } catch (e) {
     say($('advMsg'), e.message, 'bad');
   }
-  btn.disabled = false;
+  loaded(btn);
 };
 
 // --------------------------------------------------------------- layout
@@ -1796,33 +2615,43 @@ function rowReasons(section) {
 }
 
 function renderLayout() {
-  const host = $('layoutSections');
-  host.innerHTML = '';
-  for (const section of ['depository', 'credit']) {
-    const cards = LAYOUT_ROWS[section] || [];
-    const block = layoutBlock(section);
-
+  const rules = $('layoutRules'), lists = $('layoutSections');
+  rules.innerHTML = '';
+  lists.innerHTML = '';
+  // Both columns are written section by section, so each one's two halves
+  // stay in the same order down the page and the headings line up across.
+  const sectionBlock = (host, section) => {
+    const col = document.createElement('div');
+    col.className = 'colblock';
     const h = document.createElement('h3');
     h.className = 'grp';
     h.textContent = SECTION_LABELS[section];
-    host.append(h);
+    col.append(h);
+    host.append(col);
+    return col;
+  };
 
-    // Heading text and the row rules belong to the section they affect,
-    // rather than in a separate settings block away from the list they
-    // change the shape of.
-    host.append(layoutField(section, 'title', 'Heading shown on the widget', 'text'));
+  for (const section of ['depository', 'credit']) {
+    const cards = LAYOUT_ROWS[section] || [];
+
+    // Heading text and the row rules still belong to the section they
+    // affect -- they're just all in the left column now, so the lists on
+    // the right are one uninterrupted run of drag targets.
+    const rule = sectionBlock(rules, section);
+    rule.append(layoutField(section, 'title', 'Heading shown on the widget', 'text'));
     if (section === 'depository') {
-      host.append(layoutField(section, 'new_row_digit_threshold',
+      rule.append(layoutField(section, 'new_row_digit_threshold',
         'Own row at this many balance digits', 'int', 'Default 6, i.e. $100,000+'));
-      host.append(layoutField(section, 'new_row_name_length_threshold',
+      rule.append(layoutField(section, 'new_row_name_length_threshold',
         'Own row past this many name characters', 'int', 'Default 12'));
     }
 
+    const list = sectionBlock(lists, section);
     if (!cards.length) {
       const p = document.createElement('p');
       p.className = 'hint2';
       p.textContent = 'Nothing in this section yet.';
-      host.append(p);
+      list.append(p);
       continue;
     }
 
@@ -1831,7 +2660,7 @@ function renderLayout() {
     ul.className = 'sortable';
     ul.dataset.section = section;
     cards.forEach((a, i) => ul.append(sortableRow(section, a, i, reasons.get(a.key))));
-    host.append(ul);
+    list.append(ul);
   }
   $('undoLayout').disabled = UNDO.length === 0;
 }
@@ -1960,6 +2789,9 @@ async function saveOrder(section, message) {
 $('undoLayout').onclick = () => {
   const last = UNDO.pop();
   if (!last) return;
+  // saveOrder is fire-and-forget from here, so there's nothing to wait on
+  // past the re-render; the button is disabled again by renderLayout when
+  // the undo stack empties.
   const byKey = new Map(LAYOUT_ROWS[last.section].map(a => [a.key, a]));
   LAYOUT_ROWS[last.section] = last.order.map(k => byKey.get(k)).filter(Boolean);
   renderLayout();
@@ -1967,14 +2799,18 @@ $('undoLayout').onclick = () => {
 };
 
 $('restartLayout').onclick = async () => {
+  const btn = $('restartLayout');
+  loading(btn, 'Restarting…');
   say($('layoutMsg'), 'Restarting…');
   try {
     const r = await api('/api/launch', {});
     say($('layoutMsg'), r.action === 'restarted'
       ? 'Restarted the widget.'
       : 'Launched. Look for the icon in your system tray.', 'ok');
-    setTimeout(loadState, 4000);
+    setTimeout(() => { loaded(btn); loadState(); }, 4000);
+    return;
   } catch (e) { say($('layoutMsg'), e.message, 'bad'); }
+  loaded(btn);
 };
 
 async function loadLayout() {
@@ -2011,7 +2847,7 @@ async function loadLayout() {
 const APPEARANCE_FIELDS = [
   { grp: 'Color and size' },
   { path: 'accent', label: 'Accent color', type: 'color',
-    sub: 'Normally your live Windows accent color' },
+    sub: 'Copied from your Windows accent at setup' },
   { path: 'corner_radius', label: 'Corner radius', type: 'int', unit: 'px' },
   { path: 'scale', label: 'Scale', type: 'float', step: 0.05, sub: '1.0 is default size' },
 
@@ -2027,14 +2863,19 @@ const APPEARANCE_FIELDS = [
   { grp: 'Theme' },
   { path: 'dark_theme', label: 'Dark theme', type: 'bool' },
   { path: 'translucent_background', label: 'Translucent background', type: 'bool', restart: true },
-  { path: 'opacity', label: 'Opacity', type: 'float', step: 0.05, min: 0.15, max: 1,
+  { path: 'opacity', label: 'Opacity', type: 'float', control: 'slider',
+    step: 0.05, min: 0.15, max: 1,
     dep: 'translucent_background', sub: '0.15 to 1; exactly 1 turns it off' },
 
   { grp: 'Card shadow' },
   { path: 'shadow.enabled', label: 'Drop shadow', type: 'bool' },
   { path: 'shadow.offset', label: 'Offset', type: 'int', unit: 'px', dep: 'shadow.enabled' },
   { path: 'shadow.border', label: 'Border', type: 'int', unit: 'px', dep: 'shadow.enabled' },
-  { path: 'shadow.color', label: 'Color', type: 'text', dep: 'shadow.enabled',
+  // optional: blank is a meaningful value here (the key goes away and the
+  // widget falls back to the theme), which is why the hex box and not the
+  // swatch is what gets saved -- a swatch has no way to be blank.
+  { path: 'shadow.color', label: 'Color', type: 'color', optional: true,
+    dep: 'shadow.enabled',
     placeholder: 'theme default', sub: 'Blank follows the theme' },
 
   { grp: 'Window' },
@@ -2064,10 +2905,156 @@ function setPath(obj, path, value) {
   cur[last] = value;
 }
 
+// A hex triple is the only thing a native swatch can hold, so it's also
+// the only thing worth copying into one.
+const HEX6 = /^#[0-9a-f]{6}$/i;
+
+// path -> the type=color input beside that field's hex box. Kept here
+// rather than given an id of its own, so 'ap:<path>' stays the one id per
+// field and mainInput() can find the value-bearing input unambiguously.
+const COLOR_SWATCH = {};
+
+// The input carrying ap:<path>, i.e. the one holding the value: the
+// control itself for a plain field, the hex box or the track for the
+// composed ones.
+const mainInput = node =>
+  node.tagName === 'INPUT' ? node : node.querySelector('.ap-main');
+
+function colorField(f) {
+  const wrap = document.createElement('span');
+  wrap.className = 'cpick';
+
+  const hex = document.createElement('input');
+  hex.type = 'text';
+  hex.className = 'cpick-hex ap-main';
+  hex.id = 'ap:' + f.path;
+  hex.spellcheck = false;
+  hex.autocomplete = 'off';
+  if (f.placeholder) hex.placeholder = f.placeholder;
+
+  const swatch = document.createElement('input');
+  swatch.type = 'color';
+  swatch.setAttribute('aria-label', f.label + ' picker');
+  COLOR_SWATCH[f.path] = swatch;
+
+  // Typing a hex moves the swatch; picking a color writes the hex. input,
+  // not change, on the swatch: the OS picker streams as you drag it, and
+  // the box should keep up rather than jump once at the end.
+  hex.oninput = () => syncColor(f.path);
+  swatch.oninput = () => { hex.value = swatch.value; syncColor(f.path); };
+
+  wrap.append(hex, swatch);
+
+  // Getting back to "follow the theme" shouldn't mean selecting the box
+  // and deleting it -- once the picker has been opened the box always has
+  // a color in it.
+  if (f.optional) {
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'cpick-clear';
+    clear.textContent = '×';
+    clear.title = 'Follow the theme instead';
+    clear.setAttribute('aria-label', 'Follow the theme instead');
+    clear.onclick = () => { hex.value = ''; syncColor(f.path); };
+    wrap.append(clear);
+  }
+  return wrap;
+}
+
+// Swatch and the .unset mark follow the box, never the other way round.
+function syncColor(path) {
+  const hex = $('ap:' + path), swatch = COLOR_SWATCH[path];
+  if (!hex || !swatch) return;
+  const text = hex.value.trim();
+  hex.parentNode.classList.toggle('unset', !text);
+  if (HEX6.test(text)) swatch.value = text.toLowerCase();
+}
+
+// The number box, not the track, is the field's value. A range input
+// quantises whatever it's given to its own step, so routing the saved
+// number through one would turn a typed 0.83 into 0.85 behind the user's
+// back; this way the track is a way of setting the box and the box is what
+// gets read.
+function sliderField(f) {
+  const wrap = document.createElement('span');
+  wrap.className = 'slider';
+  const step = f.type === 'int' ? 1 : (f.step || 0.05);
+
+  const track = document.createElement('input');
+  track.type = 'range';
+  track.step = step;
+  track.setAttribute('aria-label', f.label);
+
+  const num = document.createElement('input');
+  num.type = 'number';
+  num.className = 'slider-num ap-main';
+  num.id = 'ap:' + f.path;
+  num.step = step;
+
+  for (const el of [track, num]) {
+    if (f.min !== undefined) el.min = f.min;
+    if (f.max !== undefined) el.max = f.max;
+  }
+
+  track.oninput = () => { num.value = track.value; syncSlider(f.path); };
+  // Nothing is clamped while it's being typed -- on the way to "0.15" you
+  // pass through "0.1", and snapping that up to the minimum mid-keystroke
+  // makes the box impossible to type into. The track just doesn't follow
+  // until the number is one it can hold.
+  num.oninput = () => syncSlider(f.path);
+  // addEventListener, not .onchange: buildAppearanceForm puts refreshDeps
+  // on the main input's onchange, which would replace this.
+  num.addEventListener('change', () => {
+    const v = parseFloat(num.value);
+    const min = parseFloat(num.min), max = parseFloat(num.max);
+    if (!Number.isFinite(v)) num.value = Number.isFinite(min) ? min : 0;
+    else if (Number.isFinite(min) && v < min) num.value = min;
+    else if (Number.isFinite(max) && v > max) num.value = max;
+    syncSlider(f.path);
+  });
+
+  // The box first: it's the value, and starting the row with it puts its
+  // left edge where every other control's is.
+  wrap.append(num, track);
+  return wrap;
+}
+
+// Track position and fill follow the box, never the other way round.
+function syncSlider(path) {
+  const num = $('ap:' + path);
+  if (!num) return;
+  const track = num.parentNode.querySelector('input[type=range]');
+  if (!track) return;
+  const v = parseFloat(num.value);
+  if (!Number.isFinite(v)) return; // mid-typing: leave the track where it is
+  const min = parseFloat(track.min) || 0, max = parseFloat(track.max);
+  track.value = v;
+  // The filled part of the track, computed from the box rather than from
+  // track.value, which the browser has just snapped to the nearest step --
+  // so the fill ends at the number actually showing.
+  if (Number.isFinite(max) && max > min) {
+    const pct = Math.min(100, Math.max(0, (v - min) / (max - min) * 100));
+    track.style.setProperty('--pct', pct.toFixed(2) + '%');
+  }
+}
+
+// Removes a key rather than blanking it -- an absent key is what the
+// widget reads as "no preference saved here".
+function delPath(obj, path) {
+  const keys = path.split('.');
+  const last = keys.pop();
+  const parent = keys.length ? getPath(obj, keys.join('.')) : obj;
+  if (parent) delete parent[last];
+}
+
 function inputFor(f) {
+  if (f.type === 'color') return colorField(f);
+  if (f.control === 'slider') return sliderField(f);
+
   const el = document.createElement('input');
-  if (f.type === 'bool') el.type = 'checkbox';
-  else if (f.type === 'color') el.type = 'color';
+  // Every boolean in this form is "the widget does this, or it doesn't",
+  // which is a switch. See the .switch rules in the stylesheet.
+  if (f.type === 'bool') { el.type = 'checkbox'; el.className = 'switch'; }
   else if (f.type === 'int' || f.type === 'float') {
     el.type = 'number';
     el.step = f.type === 'int' ? 1 : (f.step || 0.05);
@@ -2078,18 +3065,28 @@ function inputFor(f) {
     if (f.placeholder) el.placeholder = f.placeholder;
   }
   el.id = 'ap:' + f.path;
+  el.classList.add('ap-main');
   return el;
 }
 
 function buildAppearanceForm() {
   const host = $('appearanceForm');
   host.innerHTML = '';
+  // The host is a two-column flow, and a group that split across the
+  // break would leave its heading at the foot of one column and half its
+  // fields at the head of the next. So each heading opens a .colblock that
+  // its fields go into, and break-inside: avoid keeps that block whole.
+  let block = null;
+  const into = el => (block || host).append(el);
   for (const f of APPEARANCE_FIELDS) {
     if (f.grp) {
+      block = document.createElement('div');
+      block.className = 'colblock';
       const h = document.createElement('h3');
       h.className = 'grp';
       h.textContent = f.grp;
-      host.append(h);
+      block.append(h);
+      host.append(block);
       continue;
     }
     const row = document.createElement('div');
@@ -2104,9 +3101,11 @@ function buildAppearanceForm() {
 
     const ctl = document.createElement('span');
     ctl.className = 'ctl';
-    const input = inputFor(f);
-    input.onchange = refreshDeps;
-    ctl.append(input);
+    const node = inputFor(f);
+    // A picker or a slider is a wrapper around its input, so the handler
+    // goes on the input rather than on the span that holds it.
+    mainInput(node).onchange = refreshDeps;
+    ctl.append(node);
     if (f.unit) {
       const u = document.createElement('span');
       u.className = 'unit';
@@ -2114,7 +3113,7 @@ function buildAppearanceForm() {
       ctl.append(u);
     }
     row.append(lbl, ctl);
-    host.append(row);
+    into(row);
   }
 
 }
@@ -2125,8 +3124,20 @@ function fillAppearanceForm(source) {
     const el = $('ap:' + f.path);
     const v = getPath(source, f.path);
     if (f.type === 'bool') el.checked = !!v;
-    else if (f.type === 'color') el.value = v || '#0078d4';
-    else el.value = v === undefined || v === null ? '' : v;
+    else if (f.type === 'color') {
+      // An optional color with nothing saved stays blank -- that blank is
+      // the "follow the theme" the field means. Only a required one needs
+      // a value to fall back on.
+      el.value = v || (f.optional ? '' : '#0078d4');
+      // Seeded to the stylesheet's own shadow default, so opening an unset
+      // picker starts from the color the widget would actually have drawn.
+      if (f.optional && !v) COLOR_SWATCH[f.path].value = '#323232';
+      syncColor(f.path);
+    }
+    else {
+      el.value = v === undefined || v === null ? '' : v;
+      if (f.control === 'slider') syncSlider(f.path);
+    }
   }
   refreshDeps();
 }
@@ -2139,7 +3150,7 @@ function refreshDeps() {
     const master = $('ap:' + row.dataset.dep);
     const on = master ? master.checked : true;
     row.classList.toggle('off', !on);
-    for (const input of row.querySelectorAll('input, select')) input.disabled = !on;
+    for (const el of row.querySelectorAll('input, select, button')) el.disabled = !on;
   }
 }
 
@@ -2158,14 +3169,18 @@ function collectAppearance() {
       continue;
     }
     const text = el.value.trim();
-    // An empty optional color means "follow the theme", which is the key
-    // being absent -- writing "" would pin every card's shadow to an
-    // invalid color instead.
-    if (!text && f.path === 'shadow.color') {
-      const parent = getPath(out, 'shadow');
-      if (parent) delete parent.color;
-      continue;
+    if (!text) {
+      // An empty optional color means "follow the theme", which is the key
+      // being absent -- writing "" would pin every card's shadow to an
+      // invalid color instead.
+      if (f.optional) { delPath(out, f.path); continue; }
+      // Blank where blank means nothing: take the swatch, which can't hold
+      // an invalid value, rather than saving an empty accent.
+      if (f.type === 'color') { setPath(out, f.path, COLOR_SWATCH[f.path].value); continue; }
     }
+    // Saved exactly as typed, hex or not: appearance.json is allowed any
+    // CSS color, and re-reading one through the swatch would quietly turn
+    // a "black" someone wrote by hand into "#000000".
     setPath(out, f.path, text);
   }
   return out;
@@ -2184,10 +3199,16 @@ async function loadAppearance() {
   }
 }
 
-$('saveAppearance').onclick = async () => {
-  const btn = $('saveAppearance');
-  btn.disabled = true;
+// Save, and optionally restart straight afterwards -- the two halves of
+// the split button. Restarting is sequential rather than a second button
+// you remember to press: a restart before the save landed would read the
+// old file, which is exactly the mistake the old side-by-side pair invited.
+async function saveAppearance(restart) {
+  const btn = $('saveAppearance'), chevron = $('saveMenuBtn');
+  loading(btn, restart ? 'Saving…' : null);
+  chevron.disabled = true;
   say($('appearanceMsg'), 'Saving…');
+  let saved = false;
   try {
     const r = await api('/api/appearance', { appearance: collectAppearance() });
     APPEARANCE = r.appearance;
@@ -2199,15 +3220,36 @@ $('saveAppearance').onclick = async () => {
     applyPageTheme(r.appearance.dark_theme, r.appearance.accent);
     STATE.dark_theme = r.appearance.dark_theme;
     STATE.accent = r.appearance.accent;
+    saved = true;
     say($('appearanceMsg'), STATE.running
       ? 'Saved. The widget picks most of this up on its next refresh; use ' +
-        'Restart Widget for anything marked restart.'
+        'Save and Restart for anything marked restart.'
       : 'Saved.', 'ok');
   } catch (e) {
     say($('appearanceMsg'), e.message, 'bad');
   }
-  btn.disabled = false;
-};
+
+  if (!saved || !restart) { loaded(btn); chevron.disabled = false; return; }
+
+  loading(btn, 'Restarting…');
+  say($('appearanceMsg'), 'Saved. Restarting…');
+  try {
+    const r = await api('/api/launch', {});
+    say($('appearanceMsg'), r.action === 'restarted'
+      ? 'Saved and restarted the widget.'
+      : 'Saved. Launched the widget – look for the icon in your system tray.', 'ok');
+    setTimeout(() => { loaded(btn); chevron.disabled = false; loadState(); }, 4000);
+    return;
+  } catch (e) {
+    say($('appearanceMsg'), 'Saved, but the restart failed: ' + e.message, 'bad');
+  }
+  loaded(btn);
+  chevron.disabled = false;
+}
+
+$('saveAppearance').onclick = () => saveAppearance(false);
+$('saveRestart').onclick = () => saveAppearance(true);
+wireMenu('saveMenuBtn', 'saveMenu');
 
 // Loaded into the form rather than written straight to disk: one wrong
 // click shouldn't be able to erase a tuned position and palette with no
@@ -2218,16 +3260,6 @@ $('restoreAppearance').onclick = () => {
   say($('appearanceMsg'), 'Defaults loaded into the form. Press Save to apply them.', 'ok');
 };
 
-$('restartWidget').onclick = async () => {
-  say($('appearanceMsg'), 'Restarting…');
-  try {
-    const r = await api('/api/launch', {});
-    say($('appearanceMsg'), r.action === 'restarted'
-      ? 'Restarted the widget.'
-      : 'Launched. Look for the icon in your system tray.', 'ok');
-    setTimeout(loadState, 4000);
-  } catch (e) { say($('appearanceMsg'), e.message, 'bad'); }
-};
 
 loadState().catch(e => say($('credsMsg'), e.message, 'bad'));
 </script>

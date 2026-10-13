@@ -36,3 +36,7 @@ logo2.png
 
 # Working notes, not documentation.
 Docs/exe_problems.md
+
+# Scratch UI reference snippets (Chakra samples pasted in while reworking
+# the setup page's controls) – source material, not part of the app.
+newUI/
