@@ -15,6 +15,7 @@ every one of them, from source and frozen alike.
     DesktopCards.exe --link       add a bank through Plaid Link
     DesktopCards.exe --accent     copy the Windows accent into appearance.json
     DesktopCards.exe --setup      first-run setup
+    DesktopCards.exe --uninstall  remove shortcuts, the app and its data
 
 Imports are deliberately inside each branch. The widget pulls in pywebview,
 pythonnet and the whole .NET interop layer; the Link flow pulls in Flask;
@@ -75,10 +76,32 @@ def redirect_output_to_log():
 # neither file is ever a dead end.
 SETUP_NAMES = ("setup", "install")
 
+# Checked before SETUP_NAMES, and the reason that check is a function of
+# its own: "Uninstall.exe" contains "install", so name order is the whole
+# difference between removing the app and reinstalling it.
+UNINSTALL_NAMES = ("uninstall",)
+
+
+def _exe_name():
+    return os.path.basename(
+        sys.executable if getattr(sys, "frozen", False) else sys.argv[0]
+    ).lower()
+
+
+def looks_like_uninstall_build():
+    return any(token in _exe_name() for token in UNINSTALL_NAMES)
+
 
 def looks_like_setup_build():
-    name = os.path.basename(sys.executable if getattr(sys, "frozen", False) else sys.argv[0])
-    return any(token in name.lower() for token in SETUP_NAMES)
+    if looks_like_uninstall_build():
+        return False
+    return any(token in _exe_name() for token in SETUP_NAMES)
+
+
+def run_uninstall():
+    import uninstall
+
+    return uninstall.main()
 
 
 def run_setup():
@@ -97,7 +120,12 @@ def main(argv=None):
 
         # The label has to account for the no-argument case resolving by
         # filename, or the log claims "widget" on a run that did setup.
-        label = mode or ("setup" if looks_like_setup_build() else "widget")
+        if mode:
+            label = mode
+        elif looks_like_uninstall_build():
+            label = "uninstall"
+        else:
+            label = "setup" if looks_like_setup_build() else "widget"
         print(f"\n=== DesktopCards {label} "
               f"{datetime.datetime.now().isoformat(timespec='seconds')} ===")
 
@@ -123,8 +151,12 @@ def main(argv=None):
         accent_color.main()
     elif mode == "--setup":
         run_setup()
+    elif mode == "--uninstall":
+        return run_uninstall()
     elif mode is None:
-        if looks_like_setup_build():
+        if looks_like_uninstall_build():
+            return run_uninstall()
+        elif looks_like_setup_build():
             run_setup()
         else:
             import widget

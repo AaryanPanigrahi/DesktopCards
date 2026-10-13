@@ -21,6 +21,9 @@ The interface the rest of the app depends on:
     window_rect(hwnd) / erase_vacated_area(window, old_rect)
     create_shortcut(...) / install_autostart(...)
     start_menu_dir() / startup_dir()
+    confirm_with_checkbox(...) / message_box(...)
+    register_uninstaller(...) / unregister_uninstaller(...)
+    delete_after_exit(...)
 """
 
 import ctypes
@@ -365,3 +368,217 @@ def system_accent():
     g = (value >> 8) & 0xFF
     b = value & 0xFF
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+# --------------------------------------------------------------- dialogs
+# Uninstall is the one thing this app does with no page to host its own
+# UI: the widget is gone or going, setup's server isn't running, and a
+# browser window asking "are you sure" that outlives the thing it was
+# asking about is worse than no window at all. So these two are the real
+# Windows dialogs, drawn by the OS.
+
+_TDF_ALLOW_DIALOG_CANCELLATION = 0x0008
+_TDF_VERIFICATION_FLAG_CHECKED = 0x0100
+_TDCBF_YES_BUTTON = 0x0002
+_TDCBF_NO_BUTTON = 0x0004
+_TD_WARNING_ICON = 0xFFFF  # MAKEINTRESOURCEW(-1)
+_IDYES = 6
+
+_MB_YESNO = 0x0004
+_MB_ICONWARNING = 0x0030
+_MB_ICONINFORMATION = 0x0040
+_MB_ICONERROR = 0x0010
+_MB_SETFOREGROUND = 0x00010000
+_MB_TOPMOST = 0x00040000
+
+
+class _TASKDIALOGCONFIG(ctypes.Structure):
+    """commctrl.h's TASKDIALOGCONFIG.
+
+    _pack_ = 1 is not a style choice: the header declares this struct
+    under #pragma pack(1), so the natural alignment ctypes would other-
+    wise apply puts every field after the first pointer at the wrong
+    offset, and the call then reads the title out of the middle of a
+    pointer.
+
+    The two icon unions are declared as the pointer-sized member they
+    are and handed an integer resource id, which is all
+    MAKEINTRESOURCEW produces anyway."""
+
+    _pack_ = 1
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.UINT),
+        ("hwndParent", ctypes.wintypes.HWND),
+        ("hInstance", ctypes.wintypes.HINSTANCE),
+        ("dwFlags", ctypes.wintypes.UINT),
+        ("dwCommonButtons", ctypes.wintypes.UINT),
+        ("pszWindowTitle", ctypes.c_wchar_p),
+        ("hMainIcon", ctypes.c_void_p),
+        ("pszMainInstruction", ctypes.c_wchar_p),
+        ("pszContent", ctypes.c_wchar_p),
+        ("cButtons", ctypes.wintypes.UINT),
+        ("pButtons", ctypes.c_void_p),
+        ("nDefaultButton", ctypes.c_int),
+        ("cRadioButtons", ctypes.wintypes.UINT),
+        ("pRadioButtons", ctypes.c_void_p),
+        ("nDefaultRadioButton", ctypes.c_int),
+        ("pszVerificationText", ctypes.c_wchar_p),
+        ("pszExpandedInformation", ctypes.c_wchar_p),
+        ("pszExpandedControlText", ctypes.c_wchar_p),
+        ("pszCollapsedControlText", ctypes.c_wchar_p),
+        ("hFooterIcon", ctypes.c_void_p),
+        ("pszFooter", ctypes.c_wchar_p),
+        ("pfCallback", ctypes.c_void_p),
+        ("lpCallbackData", ctypes.c_void_p),
+        ("cxWidth", ctypes.wintypes.UINT),
+    ]
+
+
+def message_box(text, title="DesktopCards", kind="info"):
+    """A plain OK box. Topmost and foreground, because whatever puts one
+    up here has usually just stopped being the active window."""
+    icons = {"info": _MB_ICONINFORMATION, "warn": _MB_ICONWARNING,
+             "error": _MB_ICONERROR}
+    ctypes.windll.user32.MessageBoxW(
+        None, str(text), str(title),
+        icons.get(kind, _MB_ICONINFORMATION) | _MB_SETFOREGROUND | _MB_TOPMOST,
+    )
+
+
+def confirm_with_checkbox(instruction, content, checkbox, title="DesktopCards",
+                          checked=True):
+    """A Yes/No task dialog with one tick box. Returns (yes, ticked).
+
+    TaskDialogIndirect is what Windows' own uninstall prompts use, and
+    the only native dialog that can carry a checkbox -- MessageBoxW has
+    no room for one, so the alternative is two windows and a question
+    the second of them can no longer take back.
+
+    It lives in comctl32 version 6, which a process only has with visual
+    styles enabled by its manifest. That holds for the frozen build and
+    for python.exe, but it is a property of how the app was built rather
+    than anything this function can arrange, so a missing export falls
+    back to two message boxes instead of failing. Esc and the X count as
+    No, which is what ALLOW_DIALOG_CANCELLATION is for -- without it the
+    dialog has no way out but an answer."""
+    checked_out = ctypes.wintypes.BOOL(checked)
+    pressed = ctypes.c_int(0)
+    cfg = _TASKDIALOGCONFIG()
+    cfg.cbSize = ctypes.sizeof(_TASKDIALOGCONFIG)
+    cfg.dwFlags = _TDF_ALLOW_DIALOG_CANCELLATION | (
+        _TDF_VERIFICATION_FLAG_CHECKED if checked else 0
+    )
+    cfg.dwCommonButtons = _TDCBF_YES_BUTTON | _TDCBF_NO_BUTTON
+    cfg.pszWindowTitle = title
+    cfg.hMainIcon = _TD_WARNING_ICON
+    cfg.pszMainInstruction = instruction
+    cfg.pszContent = content
+    cfg.pszVerificationText = checkbox
+
+    try:
+        hr = ctypes.windll.comctl32.TaskDialogIndirect(
+            ctypes.byref(cfg), ctypes.byref(pressed), None,
+            ctypes.byref(checked_out),
+        )
+    except (AttributeError, OSError) as e:
+        print(f"[dialog] no task dialog here ({e}); using message boxes")
+        return _confirm_with_two_boxes(instruction, content, checkbox)
+    if hr != 0:
+        print(f"[dialog] TaskDialogIndirect failed (0x{hr & 0xFFFFFFFF:08x})")
+        return _confirm_with_two_boxes(instruction, content, checkbox)
+    return pressed.value == _IDYES, bool(checked_out.value)
+
+
+def _confirm_with_two_boxes(instruction, content, checkbox):
+    """The fallback, asked in the same order: No to the first means the
+    second is never put up and nothing has happened yet."""
+    flags = _MB_YESNO | _MB_ICONWARNING | _MB_SETFOREGROUND | _MB_TOPMOST
+    box = ctypes.windll.user32.MessageBoxW
+    if box(None, f"{instruction}\n\n{content}", "DesktopCards", flags) != _IDYES:
+        return False, False
+    return True, box(None, f"{checkbox}?", "DesktopCards", flags) == _IDYES
+
+
+# ------------------------------------------------------- Add/Remove entry
+# HKCU, not HKLM: everything this app installs is per-user and writable
+# without a prompt, and an uninstall entry needing administrator to clear
+# would be the only part of it that did.
+_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+
+
+def register_uninstaller(uninstall_exe, name="DesktopCards",
+                         display_name="DesktopCards", icon=None,
+                         install_location=None, version=None,
+                         publisher="DesktopCards", size_kb=None):
+    """Lists the app in Settings > Apps with a working Uninstall button.
+
+    The command is quoted even though these paths rarely need it: the
+    value is handed to a shell, and %LOCALAPPDATA% contains the user's
+    own name, which is free to contain a space."""
+    import winreg
+
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                              _UNINSTALL_KEY + "\\" + name) as key:
+            def put(field, value, kind=winreg.REG_SZ):
+                if value is not None:
+                    winreg.SetValueEx(key, field, 0, kind, value)
+
+            put("DisplayName", display_name)
+            put("UninstallString", f'"{uninstall_exe}"')
+            put("DisplayIcon", icon or uninstall_exe)
+            put("InstallLocation", install_location)
+            put("DisplayVersion", version)
+            put("Publisher", publisher)
+            put("EstimatedSize", size_kb, winreg.REG_DWORD)
+            # Both set: a per-user install with no repair path, so the
+            # Settings entry offers Uninstall and nothing else.
+            put("NoModify", 1, winreg.REG_DWORD)
+            put("NoRepair", 1, winreg.REG_DWORD)
+        return True
+    except OSError as e:
+        print(f"[install] could not register the uninstaller: {e}")
+        return False
+
+
+def unregister_uninstaller(name="DesktopCards"):
+    """Removes that entry. True once it is gone, however it got there."""
+    import winreg
+
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _UNINSTALL_KEY + "\\" + name)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        print(f"[uninstall] could not remove the Add/Remove entry: {e}")
+        return False
+
+
+# ------------------------------------------------------------ self-delete
+def delete_after_exit(files, directories=(), delay_seconds=3):
+    """Deletes files once this process is gone, through a detached shell.
+
+    Windows holds an executing image open, so the uninstaller cannot be
+    the thing that deletes the uninstaller. A short-lived cmd that waits
+    for us to exit and then removes the files is the standard way round
+    that, and it needs no helper binary of its own.
+
+    ping is the sleep: timeout.exe wants a console this detached process
+    hasn't got, where ping always takes its interval. Directories go
+    through rmdir without /s, so one still holding a file the user asked
+    to keep is left alone rather than emptied."""
+    steps = [f"ping -n {int(delay_seconds) + 1} 127.0.0.1 >nul"]
+    steps += [f'del /f /q "{f}"' for f in files]
+    steps += [f'rmdir "{d}"' for d in directories]
+    command = "cmd /c " + " & ".join(steps)
+    subprocess.Popen(
+        command,
+        creationflags=(
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        ),
+        close_fds=True,
+    )
+    return command

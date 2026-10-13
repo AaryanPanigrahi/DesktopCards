@@ -50,6 +50,7 @@ hiddenimports = [
     "accent_color",
     "plaid_link_setup",
     "setup_app",
+    "uninstall",
     "platform_win",
     "logo_cache",
     "paths",

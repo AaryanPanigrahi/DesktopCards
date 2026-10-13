@@ -141,6 +141,16 @@ def installed_exe_path():
     return os.path.join(DATA_DIR, f"{APP_NAME}.exe")
 
 
+def uninstall_exe_path():
+    """The uninstaller, beside the app it removes.
+
+    A third copy of the same binary, like the setup one: the filename is
+    what selects the mode (see desktopcards.looks_like_uninstall_build),
+    so there is nothing to build separately and nothing that can fall out
+    of step with the app it is uninstalling."""
+    return os.path.join(DATA_DIR, "Uninstall.exe")
+
+
 def launch_target():
     """What a shortcut should point at, with what arguments, and its icon.
 
@@ -854,12 +864,56 @@ def install_binary():
         raise
 
 
+def install_uninstaller():
+    """Puts Uninstall.exe next to the app and lists it in Settings.
+
+    Returns the path, or None when there is nothing to install -- from
+    source there is no single file to copy, and the uninstaller is then
+    reached with --uninstall instead.
+
+    Failures here are reported but never fatal: an app that refused to
+    finish installing because its uninstaller could not be written would
+    be a worse outcome than one you remove from the Modify page."""
+    if not FROZEN:
+        return None
+    target = uninstall_exe_path()
+    try:
+        if os.path.abspath(sys.executable) != os.path.abspath(target):
+            shutil.copy2(sys.executable, target)
+    except OSError as e:
+        # In use means a previous uninstall is mid-flight, in which case
+        # the copy already there is the one we would have written.
+        if not os.path.exists(target):
+            print(f"[install] could not write {target}: {e}")
+            return None
+        print(f"[install] {target} is in use; keeping the existing copy")
+
+    import logo_cache
+
+    n = native()
+    size_kb = None
+    try:
+        size_kb = int(os.path.getsize(target) / 1024) * 2  # app + uninstaller
+    except OSError:
+        pass
+    n.register_uninstaller(
+        target,
+        name=APP_NAME,
+        display_name=APP_NAME,
+        icon=logo_cache.icon_file() or target,
+        install_location=DATA_DIR,
+        size_kb=size_kb,
+    )
+    return target
+
+
 @app.route("/api/install", methods=["POST"])
 def api_install():
     body = request.get_json(silent=True) or {}
     autostart = bool(body.get("autostart"))
     n = native()
-    result = {"app_path": None, "start_menu": None, "startup": None}
+    result = {"app_path": None, "start_menu": None, "startup": None,
+              "uninstaller": None}
 
     seed_data_dir()
 
@@ -888,6 +942,9 @@ def api_install():
         autostart, exe, arguments=args, icon=icon, name=APP_NAME,
         working_dir=working_dir,
     )
+    # Last, and after the shortcuts: what it is registered to remove has
+    # to exist before it is advertised as the way to remove it.
+    result["uninstaller"] = install_uninstaller()
     print(f"installed: {result}")
     return jsonify(ok=True, **result)
 

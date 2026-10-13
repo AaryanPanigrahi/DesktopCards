@@ -335,6 +335,19 @@ def restart_now(icon, window):
     force_exit_soon()
 
 
+def quit_now(icon, window):
+    """The tray's Quit, reachable from outside the process.
+
+    Same three steps the menu item performs, in the same order, plus the
+    lock: it is released explicitly here because nothing is replacing
+    this widget: the uninstaller is about to delete the exe, and a lock
+    left held would outlive the files it was guarding."""
+    icon.stop()
+    native.release_single_instance()
+    window.destroy()
+    force_exit_soon()
+
+
 def make_tray_icon(port, window, appearance):
     image = build_tray_image(appearance.get("accent", "#0078d4"))
 
@@ -375,12 +388,11 @@ def make_tray_icon(port, window, appearance):
             webbrowser.open(url)
 
     def on_quit(icon, item):
-        icon.stop()
-        window.destroy()
-        # Same backstop as Restart, for the same reason -- a Quit that
-        # leaves the process alive is worse, since nothing replaces it and
-        # the single-instance lock then blocks the next launch.
-        force_exit_soon()
+        # The backstop inside quit_now matters for the same reason it does
+        # for Restart -- a Quit that leaves the process alive is worse,
+        # since nothing replaces it and the single-instance lock then
+        # blocks the next launch.
+        quit_now(icon, window)
 
     menu = pystray.Menu(
         pystray.MenuItem("Reload", on_reload),
@@ -490,6 +502,9 @@ def main():
     # Registered here rather than earlier because it closes over the tray
     # and the window, which have to exist before it can be called.
     serve.restart_hook = lambda: restart_now(tray, window)
+    # And POST /quit, which the uninstaller uses to close this widget
+    # before deleting the exe it is running from.
+    serve.quit_hook = lambda: quit_now(tray, window)
 
     # Started on 'shown' rather than here: the catch-up fetch can fire
     # immediately, and it calls evaluate_js when it finishes, which needs a

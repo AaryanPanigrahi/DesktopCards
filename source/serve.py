@@ -76,6 +76,11 @@ DATA_OWNED = ("data.json", "cache/")
 # something to call. Left None by a standalone `--serve`, which has no
 # widget to restart -- see Handler.handle_restart.
 restart_hook = None
+# Likewise for POST /quit, which the uninstaller uses to close the widget
+# before it starts deleting the exe that widget is running from. Asking
+# rather than killing matters here: the widget's own quit path releases
+# the single-instance lock, and a kill leaves that lock behind.
+quit_hook = None
 
 
 def resolve_spacing(appearance):
@@ -204,6 +209,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.path == "/restart":
             self.handle_restart()
             return
+        if self.path == "/quit":
+            self.handle_quit()
+            return
         if self.path != "/refresh":
             self.send_error(404, "Not Found")
             return
@@ -244,6 +252,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except OSError:
             pass
         threading.Thread(target=restart_hook, daemon=True).start()
+
+    def handle_quit(self):
+        """Shuts the widget down on request from another process.
+
+        Only the uninstaller asks for this, and it needs the answer
+        before the shutdown rather than after: the server is a thread
+        inside the process being stopped, so a reply written afterwards
+        would never leave. Same shape as handle_restart, and 404 from a
+        bare `--serve` for the same reason -- there is no widget in that
+        process to stop."""
+        if quit_hook is None:
+            self.send_json({"ok": False, "error": "no widget in this process"}, 404)
+            return
+        self.send_json({"ok": True})
+        try:
+            self.wfile.flush()
+        except OSError:
+            pass
+        threading.Thread(target=quit_hook, daemon=True).start()
 
     def send_json(self, payload, status=200):
         body = json.dumps(payload).encode("utf-8")

@@ -66,6 +66,16 @@ have. It's file-only on purpose – a control that restyles the control you're
 holding is a toy rather than a setting. Set `enabled` to `false`, or tune the
 distances per group, and reload the page.
 
+## Uninstalling
+
+`Uninstall.exe` sits next to the app in `%LOCALAPPDATA%\DesktopCards\`, and
+DesktopCards is listed in **Settings → Apps**, so either route works. It
+confirms first, with **Keep my settings and linked accounts** ticked – leave
+it ticked and your Plaid credentials, linked banks and appearance survive for
+a reinstall; clear it and the folder goes entirely. Your banks stay linked at
+Plaid either way. From a checkout:
+`python source/desktopcards.py --uninstall`.
+
 ## What's in this repo
 
 | | |

@@ -86,11 +86,66 @@ bundle they're flattened in with everything else, which is the only reason
 The split is not optional for a packaged build: anything written into that
 temp directory is deleted when the app exits.
 
+`%LOCALAPPDATA%\DesktopCards\` is also where the installed `DesktopCards.exe`
+and `Uninstall.exe` live, so the app, its uninstaller and its data are one
+folder – which is what lets uninstalling be "delete this folder" (see
+Uninstalling).
+
 **The gotcha worth knowing:** if you're running the packaged build, editing
 `config/appearance.json` in the repo does nothing – the exe reads the copy in
 `%LOCALAPPDATA%\DesktopCards\`. Edit that one, then tray → Restart. Easier
 still, use the Modify page, which always writes wherever the running app
 actually reads (see Settings without editing JSON).
+
+## Uninstalling
+
+`Uninstall.exe`, written into `%LOCALAPPDATA%\DesktopCards\` beside the app
+by the install step, and listed in **Settings → Apps** so the Uninstall button
+there works. From a checkout there is no installed file to run, so it's
+`python source/desktopcards.py --uninstall` instead.
+
+It asks first, in a Windows task dialog – the kind Windows' own uninstallers
+use, and the only native dialog that can carry a checkbox. **Keep my settings
+and linked accounts** is ticked by default:
+
+| | Ticked (default) | Cleared |
+|---|---|---|
+| `config.json` (Plaid keys, one access token per bank) | kept | deleted |
+| `appearance.json`, a replaced `logo.png` | kept | deleted |
+| `data.json`, `cache/`, `desktopcards.log` | deleted | deleted |
+| `%LOCALAPPDATA%\DesktopCards\` itself | stays, holding what was kept | removed |
+
+`data.json` goes either way: it's the last fetch's balances, regenerated
+within a minute of the next launch, and stale balances are the one thing
+nobody wants left behind. Either way your banks stay linked at Plaid –
+removing an Item there is irreversible and isn't something an uninstaller
+should decide (same reasoning as removing one bank from the Accounts tab).
+
+Then, in this order, because the order is the only thing that makes it work:
+
+1. **The widget is asked to quit**, through `POST /quit` on its own server –
+   not killed. Its quit path stops the tray icon, releases the single-instance
+   lock and lets its writes finish; a kill leaves that lock behind to block
+   the next install. Any setup server gets `POST /api/quit`. `taskkill` is the
+   backstop, used only if something is still answering afterwards.
+2. **Shortcuts go** – the Start-menu entry and the Startup one. Both are just
+   files, which is why `install_autostart` uses the Startup folder rather than
+   a `Run` registry key.
+3. **The Add/Remove entry goes**, from `HKCU`. Nothing here needs
+   administrator: shortcuts live in `%APPDATA%`, the app and its data in
+   `%LOCALAPPDATA%`, and the uninstall entry in the per-user hive.
+4. **Data goes**, minus whatever the checkbox saved.
+5. **The two exes go last, from outside the process.** Windows holds an
+   executing image open, so the uninstaller can't delete the uninstaller. A
+   detached `cmd` waits for this process to exit, then deletes both and
+   `rmdir`s the folder – without `/s`, so a folder still holding kept
+   settings is simply left alone.
+
+It's the same binary as the app, a third time: the filename picks the mode.
+That does mean one trap worth knowing about, since `Uninstall.exe` contains
+the string `install` – `looks_like_uninstall_build()` is checked *before*
+`looks_like_setup_build()`, or double-clicking the uninstaller would reinstall
+the app instead.
 
 ## Pieces
 
@@ -771,6 +826,11 @@ in a frozen build for the same reason: `sys.executable` *is* the app, it
 takes no script argument, and there are no `.py` files on disk to point at.
 `desktopcards.py` replaces them with subcommands, so `sys.executable` plus a
 flag covers every case, from source and frozen alike.
+
+Two of those modes are also selected by filename, for the builds someone
+double-clicks rather than types: a name containing `setup` or `install` runs
+setup, and one containing `uninstall` runs the uninstaller. An explicit flag
+always wins, so no copy of the exe is ever a dead end.
 
 ### No console, so output goes to a file
 
