@@ -60,16 +60,16 @@ PROJECT_DIR = ASSET_DIR
 WINDOW_TITLE = "Balances"
 PAGE = "dashboard.html"
 
-# Not config: WINDOW_WIDTH is only the size before the page's first layout
-# pass corrects it (dashboard.js fitWindowToContent immediately resizes to
-# the real, scale-aware width -- keep in sync with dashboard.html's #shell
-# { width: ... }, the actual design-width source of truth). max_height is a
-# safety ceiling (so a lot of accounts can't grow the window past a sane
-# size), not a tuned preference -- the actual height always comes from the
-# page measuring its own content. extra_spacing in appearance.json is what
+# Not config: these are only the size before the page's first layout pass
+# corrects it (dashboard.js fitWindowToContent immediately resizes to the
+# real, scale-aware size -- keep WINDOW_WIDTH in sync with dashboard.html's
+# #shell { width: ... }, the actual design-width source of truth). The real
+# height always comes from the page measuring its own content, and is not
+# capped: enough linked accounts is a reason for a taller window, not a
+# reason to hide the last card. extra_spacing in appearance.json is what
 # controls breathing room, not these.
 WINDOW_WIDTH = 325
-MAX_HEIGHT = 700
+INITIAL_HEIGHT = 700
 
 def force_exit_soon(delay=2.5):
     """A watchdog that ends this process if a clean shutdown doesn't.
@@ -150,17 +150,19 @@ def save_appearance_snapshot(appearance):
 
 
 class Api:
-    def __init__(self, window, max_height, corner_radius, translucent=False):
+    def __init__(self, window, corner_radius, translucent=False):
         self._window = window
-        self._max_height = max_height
         self._corner_radius = corner_radius
         self._translucent = translucent
 
     def resize_window(self, width, height):
-        # Width has no cap (only height does, as a safety ceiling) -- a
-        # scale above 1 is expected to grow the window as wide as it needs.
+        # Neither dimension is capped -- a scale above 1 is expected to grow
+        # the window as wide as it needs, and enough linked accounts is
+        # expected to grow it as tall as it needs. The page has already
+        # measured its own content; second-guessing that here only ever
+        # showed up as a card cut off at the bottom.
         width = max(1, int(width))
-        height = max(1, min(int(height), self._max_height))
+        height = max(1, int(height))
         # Captured before the resize, because afterwards there's no record of
         # how much of the desktop this window was covering.
         stale = (
@@ -471,7 +473,7 @@ def main():
         WINDOW_TITLE,
         url=f"http://{LOOPBACK}:{port}/{PAGE}",
         width=WINDOW_WIDTH,
-        height=MAX_HEIGHT,
+        height=INITIAL_HEIGHT,
         x=win.get("x", 100),
         y=win.get("y", 100),
         frameless=True,
@@ -484,7 +486,7 @@ def main():
         background_color=page_background,
         transparent=translucent,
     )
-    api = Api(window, MAX_HEIGHT, corner_radius, translucent)
+    api = Api(window, corner_radius, translucent)
     window.expose(api.resize_window)
 
     window.events.shown += lambda: native.hide_from_taskbar(window)

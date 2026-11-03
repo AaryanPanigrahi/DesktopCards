@@ -26,6 +26,7 @@ Served on localhost only. Credentials go from the form straight into
 config.json in DATA_DIR and are never echoed back to the page.
 """
 
+import datetime
 import json
 import os
 import re
@@ -42,12 +43,13 @@ from flask import Flask, jsonify, request
 
 import net_guard
 import plaid_link_setup as link
+import profiles
 from paths import (
     APPEARANCE_EXAMPLE_PATH,
     APPEARANCE_PATH,
     ASSET_DIR,
     CONFIG_EXAMPLE_PATH,
-    CONFIG_PATH,
+    CONFIG_SNAPSHOT_PATH,
     DATA_DIR,
     DATA_PATH,
     DETACHED,
@@ -56,6 +58,9 @@ from paths import (
     SETUP_PORT,  # 5000 is the dashboard, 8008 is standalone --link
     clean_child_env,
     ensure_data_dir,
+    profile_data_path,
+    profile_layout_path,
+    profile_snapshot_path,
 )
 
 APP_NAME = "DesktopCards"
@@ -206,13 +211,14 @@ def ask_widget_to_restart():
 
 
 def read_config():
-    if not os.path.exists(CONFIG_PATH):
-        return None
-    try:
-        with open(CONFIG_PATH, "r") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
+    """The raw config.json, migrating a pre-profiles install first.
+
+    Still the file as it sits on disk, so the callers that only want a
+    shared setting (port, fetch_interval_minutes) are unchanged. Anything
+    wanting credentials asks profiles.active() instead -- those live in
+    secrets.json now and are never in this dict."""
+    config = profiles.ensure_migrated()
+    return config or None
 
 
 def seed_data_dir():
@@ -231,9 +237,13 @@ def seed_data_dir():
 
 
 def config_skeleton(client_id, secret, environment):
-    """A new config.json, starting from the shipped example so defaults
-    like port and fetch_interval_minutes come along rather than being
-    re-invented here."""
+    """The credentials to verify, plus the shared defaults from the
+    shipped example so port and fetch_interval_minutes come along rather
+    than being re-invented here.
+
+    Not a config.json any more: profiles own the credentials, and
+    api_credentials takes only the shared keys off this.
+    """
     example = CONFIG_EXAMPLE_PATH
     config = {}
     if os.path.exists(example):
@@ -249,8 +259,28 @@ def config_skeleton(client_id, secret, environment):
     })
     config.setdefault("port", 5000)
     config.setdefault("fetch_interval_minutes", 90)
-    config.setdefault("items", [])
+    # Deliberately no items/items_created: those belong to a profile now,
+    # and leaving them here would have the example's placeholder profile
+    # look like real linked banks.
+    config.pop("profiles", None)
+    config.pop("_comment", None)
     return config
+
+
+# Plaid's Trial plan allows this many Production Items over the lifetime of
+# a team. Not enforced here -- a paid plan lifts it and we have no way to
+# tell which plan a client_id is on -- so this only drives what the page
+# tells the user about how much of a free tier they have spent.
+TRIAL_ITEM_CAP = 10
+
+
+def items_created(profile):
+    """How many Plaid Items this profile has ever created.
+
+    Delegates to profiles.items_created so the counter has one
+    implementation: fetch_data and the link flow read it too, and two
+    copies of the len(items) fallback would eventually disagree."""
+    return profiles.items_created(profile)
 
 
 def item_summary(config):
@@ -269,6 +299,45 @@ def item_summary(config):
 SECTION_TYPES = ("depository", "credit")
 SECTION_FALLBACK_TITLES = {"depository": "Checking & Savings", "credit": "Credit Cards"}
 
+# "other" is everything the dashboard doesn't draw as its own section --
+# loans, investments and anything Plaid adds later. It can be hidden but
+# not ordered or retitled, so it carries a hidden list and nothing else,
+# and api_layout still refuses it.
+OTHER_SECTION = "other"
+HIDEABLE_SECTIONS = SECTION_TYPES + (OTHER_SECTION,)
+
+
+def clear_fetched_data():
+    """Forget everything the last fetch produced.
+
+    Written empty rather than deleted: the dashboard and this page both
+    read data.json and treat a missing file the same as a failed read, so
+    an explicit empty list is the difference between "no accounts" and
+    "something went wrong". The snapshot goes entirely -- it only exists
+    to diff against the next run, and a diff against banks that are no
+    longer linked would suppress the logo fetch for whatever gets linked
+    next."""
+    try:
+        ensure_data_dir()
+        with open(DATA_PATH, "w") as f:
+            json.dump(
+                {
+                    "last_updated": datetime.datetime.now().isoformat(),
+                    "accounts": [],
+                    "errors": [],
+                },
+                f,
+                indent=2,
+            )
+    except OSError as e:
+        print(f"[setup] could not clear {DATA_PATH}: {e}", file=sys.stderr)
+    try:
+        os.remove(CONFIG_SNAPSHOT_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"[setup] could not clear snapshot: {e}", file=sys.stderr)
+
 
 def read_data():
     """data.json, or an empty dict before the first fetch has run."""
@@ -279,17 +348,29 @@ def read_data():
         return {}
 
 
-def order_key(account):
-    """The "Bank Name,last4" string appearance.json's layout order uses.
+def order_key(account, namespaced=True):
+    """The "Bank Name,last4" string the layout order uses.
 
     Must match dashboard.js's orderKey exactly, or a hand-written order
     silently matches nothing and every card falls through to the appended
-    tail. Mask-less accounts fall back to name, same as there."""
+    tail. Mask-less accounts fall back to name, same as there.
+
+    The profile id is always prefixed, however many profiles are
+    enabled: the same bank linked in two profiles produces the same
+    "Bank,last4", so a plain key would move or hide both cards. Keeping
+    the shape constant also stops the keys changing when a profile is
+    switched on or off, which used to discard a hand-sorted order. Pass
+    namespaced=False only for the un-prefixed form, which nothing writes
+    any more and only the widget still reads, as a fallback."""
     mask = account.get("mask")
     institution = account.get("institution_name", "Unknown")
     if mask:
-        return f"{institution},{mask}"
-    return f"{institution} {account.get('name', '')}"
+        key = f"{institution},{mask}"
+    else:
+        key = f"{institution} {account.get('name', '')}"
+    if namespaced and account.get("profile"):
+        return profiles.layout_key(account["profile"], key)
+    return key
 
 
 def balance_digits(account):
@@ -329,6 +410,11 @@ def account_summary():
             "mask": account.get("mask"),
             "key": key,
             "hidden": key in hidden,
+            # Set by fetch_data.py only when more than one profile is
+            # enabled, which is exactly when two accounts in this list can
+            # otherwise be indistinguishable: the same bank linked in two
+            # profiles reads as one bank twice.
+            "profile_label": account.get("profile_label"),
             # How many digits the balance has, never the balance. The Layout
             # tab needs it to say whether a card breaks onto its own row at
             # the current threshold, and it has to be a count rather than a
@@ -348,12 +434,13 @@ def account_summary():
     ]
     other = [a for a in accounts if a.get("type") not in SECTION_TYPES]
     if other:
-        # Not a configurable section: the dashboard draws these under a
-        # plain "Other" heading with no order or hidden list behind it, so
-        # they're listed here for completeness but can't be toggled.
+        # Hideable but not orderable: the dashboard draws these under a
+        # plain "Other" heading in fetch order, so there's nothing to sort
+        # or retitle, but switching off a mortgage you never wanted on the
+        # widget is the whole point of this list.
         groups.append({
-            "type": "other",
-            "accounts": [entry(a, "other") for a in other],
+            "type": OTHER_SECTION,
+            "accounts": [entry(a, OTHER_SECTION) for a in other],
         })
     return groups
 
@@ -375,9 +462,29 @@ def default_appearance():
 def read_appearance():
     try:
         with open(APPEARANCE_PATH, "r") as f:
-            return json.load(f)
+            appearance = json.load(f)
     except (OSError, ValueError):
-        return default_appearance()
+        appearance = default_appearance()
+    # Layout belongs to a profile, appearance does not: the order key is
+    # "Bank,last4", which collides the moment the same bank is linked in
+    # two profiles, while colours and fonts are how the widget looks
+    # whatever is enabled. So it lives in layout.<profile>.json and is
+    # grafted on here, then split back out by write_appearance(). That
+    # keeps every call site that reads appearance["layout"] working
+    # unchanged, which is most of this file.
+    # One shared file with profile-prefixed keys, whatever is enabled.
+    # The call sites below see the shape they saw when this lived in
+    # appearance.json; only the keys inside the order and hidden lists
+    # carry a prefix now.
+    if profiles.profiles():
+        # Merged, not replaced: the section titles and the row-break
+        # thresholds never moved out of appearance.json, so handing back
+        # the saved block alone reset the titles to their defaults the
+        # first time a profile existed.
+        appearance["layout"] = profiles.layout_with_settings(
+            appearance.get("layout", {}), profiles.shared_layout()
+        )
+    return appearance
 
 
 def sync_layout_order(appearance):
@@ -390,27 +497,102 @@ def sync_layout_order(appearance):
     file self-documenting: the order you see is the order being used.
 
     Keys already present keep their position, so a hand-sorted order
-    survives; new accounts are appended and departed ones dropped."""
+    survives; new accounts are appended and departed ones dropped.
+
+    A key belonging to a profile that is not currently enabled is kept
+    where it is rather than dropped. It names a card that exists and is
+    simply not being drawn, and discarding it is what used to rebuild the
+    whole order the first time a second profile was switched on."""
     layout = appearance.setdefault("layout", {})
     accounts = read_data().get("accounts", [])
+    drawing = {prof["id"] for prof in profiles.enabled()}
+
+    def belongs_to_a_drawing_profile(key):
+        pid = (key or "").split(":", 1)[0]
+        return pid in drawing
+
     for section in SECTION_TYPES:
         block = layout.setdefault(section, {})
         block.setdefault("title", SECTION_FALLBACK_TITLES[section])
         keys = [order_key(a) for a in accounts if a.get("type") == section]
-        kept = [k for k in block.get("order", []) if k in keys]
+        kept = [
+            k for k in block.get("order", [])
+            if k in keys or not belongs_to_a_drawing_profile(k)
+        ]
         block["order"] = kept + [k for k in keys if k not in kept]
         # Deliberately NOT pruned to what's present, unlike order. A bank
         # that errors on one fetch drops out of data.json, and pruning here
         # would quietly unhide an account someone had switched off -- the
         # worse of the two failures. Stale keys cost nothing but a line.
         block.setdefault("hidden", [])
+    # "other" gets a hidden list and nothing else -- no title or order,
+    # because the dashboard draws it under a fixed heading in fetch order
+    # and api_layout refuses the section. Created unconditionally so the
+    # key is there to write into the first time something is hidden.
+    layout.setdefault(OTHER_SECTION, {}).setdefault("hidden", [])
     return appearance
 
 
 def write_appearance(appearance):
+    """The other half of the seam in read_appearance(): layout goes to the
+    profile's own file, everything else to appearance.json.
+
+    With no profile yet -- first run, before any credentials -- layout
+    stays in appearance.json, because there is nothing to key it by. It
+    is adopted into the shared file the first time a profile exists."""
     ensure_data_dir()
-    with open(APPEARANCE_PATH, "w") as f:
-        json.dump(appearance, f, indent=2)
+    payload = dict(appearance)
+    layout = payload.pop("layout", None) if "layout" in payload else None
+    if layout is not None:
+        if profiles.profiles():
+            profiles.write_merged_layout(_merge_saved_order(layout))
+        else:
+            # First run, before any credentials: nothing to key a layout
+            # file by, so it stays in appearance.json until there is.
+            payload["layout"] = layout
+    # Through profiles._write_json for the temp-file-and-replace that
+    # every other file in this app gets. A plain open() here truncated
+    # appearance.json if anything went wrong mid-write.
+    profiles._write_json(APPEARANCE_PATH, payload)
+
+
+def _merge_saved_order(layout):
+    """A saved layout folded into the one on disk.
+
+    The page only lists accounts from enabled profiles, so what comes
+    back names a subset of the order. Writing it as-is would delete every
+    entry belonging to a profile that is switched off. Each of those is
+    anchored to the entry in front of it and travels with it, so a card
+    moved across a switched-off one leaves it at the bottom of the
+    move."""
+    on_disk = profiles.read_merged_layout()
+    accounts = read_data().get("accounts", [])
+    out = {}
+    for section, block in (layout or {}).items():
+        # "_comment" and anything else that is not a section block.
+        if not isinstance(block, dict):
+            out[section] = block
+            continue
+        block = dict(block)
+        drawable = [order_key(a) for a in accounts if a.get("type") == section]
+        # The file on disk gets the same treatment: it is hand-editable,
+        # and a non-section value there is not this function's business.
+        previous = on_disk.get(section)
+        previous = dict(previous) if isinstance(previous, dict) else {}
+        block["order"] = profiles.merge_order(
+            previous.get("order") or [], block.get("order") or [], drawable
+        )
+        # Hidden is a union, not a replacement, for the same reason: the
+        # page cannot un-hide what it was never shown.
+        was_hidden = [
+            k for k in (previous.get("hidden") or [])
+            if k not in drawable
+        ]
+        block["hidden"] = list(
+            dict.fromkeys(list(block.get("hidden") or []) + was_hidden)
+        )
+        out[section] = block
+    return out
 
 
 # ------------------------------------------------------------------ routes
@@ -520,12 +702,32 @@ def api_state():
     Deliberately carries no client_id or secret -- the page never needs
     them back, and not sending them means they can't leak into a browser
     cache or a screenshot."""
-    config = read_config()
+    config = profiles.read_config()
+    secrets_store = profiles.read_secrets()
+    active = profiles.active(config, secrets_store)
     _, _, _icon = launch_target()
     return jsonify(
-        configured=bool(config and config.get("client_id") and config.get("secret")),
-        environment=(config or {}).get("environment"),
-        items=item_summary(config),
+        configured=bool(active),
+        environment=(active or {}).get("environment"),
+        items=item_summary(active),
+        items_created=items_created(active),
+        # What this profile's Plaid team has actually spent, which is not
+        # the same number once two production profiles share a client id:
+        # the Trial cap belongs to the team, so their counts add up. Sent
+        # alongside rather than instead of items_created so the page can
+        # show "4 here, 6 on this team" when they differ.
+        trial_items_used=(
+            profiles.trial_items_used(config, secrets_store, active["client_id"])
+            if active else 0
+        ),
+        trial_item_cap=TRIAL_ITEM_CAP,
+        # The whole profile list comes down with the state, so the page
+        # renders the Advanced section without a second round trip.
+        profiles=[
+            profile_view(pid, config, secrets_store)
+            for pid in profiles.profiles(config)
+        ],
+        backups=profiles.list_backups(),
         frozen=FROZEN,
         data_dir=DATA_DIR,
         installed=os.path.exists(installed_exe_path()) if FROZEN else True,
@@ -575,7 +777,7 @@ def api_visibility():
     body = request.get_json(silent=True) or {}
     key = body.get("key")
     section = body.get("type")
-    if not key or section not in SECTION_TYPES:
+    if not key or section not in HIDEABLE_SECTIONS:
         return jsonify(ok=False, error="Need an account key and a known section."), 400
 
     appearance = read_appearance()
@@ -613,11 +815,16 @@ def api_appearance_save():
     # Same reasoning for the file-only shadow block: the editor has no field
     # for it, so the object posted back carries whatever was on disk when
     # the tab loaded, and that would overwrite an edit made since.
-    on_disk = read_appearance().get("shadow_ui")
-    if on_disk is None:
-        appearance.pop("shadow_ui", None)
-    else:
-        appearance["shadow_ui"] = on_disk
+    # Same for the two other file-only blocks. "colors" is the widget's
+    # palette and this page has no field for it either; without this a
+    # save would write back whatever copy the tab loaded with, which is
+    # how a hand-edited colour would silently revert.
+    for file_only in ("shadow_ui", "colors"):
+        on_disk = read_appearance().get(file_only)
+        if on_disk is None:
+            appearance.pop(file_only, None)
+        else:
+            appearance[file_only] = on_disk
     sync_layout_order(appearance)
     write_appearance(appearance)
     print(f"wrote {APPEARANCE_PATH}")
@@ -655,17 +862,25 @@ def api_layout():
         order = patch["order"]
         if not isinstance(order, list) or not all(isinstance(k, str) for k in order):
             return jsonify(ok=False, error="order must be a list of keys."), 400
-        # Reordering can only permute what's already there. Anything else is
-        # a stale page posting keys for accounts that have since gone, and
-        # sync_layout_order would drop them on the next read anyway.
-        known = set(block.get("order", []))
-        if set(order) != known:
+        # Reordering can only permute what the page was actually shown,
+        # which is the accounts of the enabled profiles. Anything else is
+        # a stale page posting keys for accounts that have since gone.
+        # Compared against those rather than the stored order, because the
+        # stored order also holds entries for switched-off profiles that
+        # the page never saw and cannot send back; write_appearance folds
+        # those back in.
+        drawable = [
+            order_key(a) for a in read_data().get("accounts", [])
+            if a.get("type") == section
+        ]
+        if set(order) != set(drawable):
             return jsonify(
                 ok=False,
                 error="That order doesn't match the accounts on file. "
                       "Reload the page and try again.",
             ), 409
-        block["order"] = order
+        block["order"] = profiles.merge_order(
+            block.get("order", []), order, drawable)
 
     for field in ("title", "new_row_digit_threshold", "new_row_name_length_threshold"):
         if field not in patch:
@@ -697,7 +912,7 @@ def api_credentials():
     # requiring both would make switching environment alone impossible
     # without retyping a secret from the Plaid dashboard. First-run setup
     # has nothing saved to fall back on, so it still fails as before.
-    saved = read_config() or {}
+    saved = profiles.active() or {}
     client_id = client_id or (saved.get("client_id") or "")
     secret = secret or (saved.get("secret") or "")
 
@@ -724,21 +939,71 @@ def api_credentials():
         ), 400
 
     seed_data_dir()
-    existing = read_config() or {}
-    # Keep any items already linked -- this path is also how someone fixes
-    # a rotated secret, and that must not drop their banks.
+    config = profiles.ensure_migrated()
+    secrets_store = profiles.read_secrets()
+
+    # Which profile these credentials belong to. The same one when the
+    # client_id and environment both match, because that is a rotated
+    # secret and the linked banks must survive it -- an access token is
+    # tied to the client_id, not the secret, so it keeps working.
     #
-    # reset_items is the opposite case, and the Advanced settings form asks
-    # for it deliberately: an access token belongs to one client_id in one
-    # environment, so switching either leaves every linked bank pointing at
-    # credentials that can no longer read it. Keeping them would just mean
-    # a widget full of items that error on every fetch, so the page warns
-    # and then wipes them rather than pretending they survived.
-    if existing.get("items") and not body.get("reset_items"):
-        candidate["items"] = existing["items"]
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(candidate, f, indent=2)
-    print(f"wrote credentials to {CONFIG_PATH} ({environment})")
+    # Any other pair is a different Plaid team or a different
+    # environment, which is a different profile rather than a destructive
+    # edit to this one. That is what removes the old warning: nothing has
+    # to be unlinked to change credentials any more, because the old
+    # profile and its banks simply stay where they are.
+    target = None
+    for pid, profile in profiles.profiles(config).items():
+        creds = secrets_store.get(pid) or {}
+        if (
+            creds.get("client_id") == client_id
+            and profile.get("environment") == environment
+        ):
+            target = pid
+            break
+
+    if target is None:
+        target = profiles.new_id(config)
+        config.setdefault("profiles", {})[target] = {
+            "environment": environment,
+            "nickname": None,
+            "enabled": True,
+            "items": [],
+            "items_created": 0,
+        }
+    else:
+        config["profiles"][target]["enabled"] = True
+
+    # This endpoint is the first-run wizard and nothing else -- the manage
+    # view's profile list has its own endpoints -- so the profile it just
+    # saved is the one being set up and has to end up enabled. Saving step
+    # 1 twice (correcting a typo in the environment, say) would otherwise
+    # leave the wizard linking banks into the first attempt.
+    #
+    # Switching the others off is free here: a first run has nothing
+    # linked yet, and it keeps the sandbox-runs-alone rule true no matter
+    # which way step 1 is filled in.
+    for other_id, other in profiles.profiles(config).items():
+        if other_id != target:
+            other["enabled"] = False
+
+    # Shared settings came from the example via config_skeleton. Seeded
+    # here rather than written wholesale, so a first run still gets a
+    # port and an interval while an existing install keeps the ones it
+    # has.
+    for key in ("port", "fetch_interval_minutes"):
+        if key in candidate:
+            config.setdefault(key, candidate[key])
+    config.setdefault("retired_profile_ids", [])
+
+    secrets_store[target] = {"client_id": client_id, "secret": secret}
+    # secrets.json first, for the reason given in profiles.migrate(): a
+    # config naming a profile whose secret never landed is recoverable by
+    # saving again, while the reverse leaves a secret for a profile that
+    # does not exist.
+    profiles.write_secrets(secrets_store)
+    profiles.write_config(config)
+    print(f"wrote credentials for profile {target} ({environment})")
     return jsonify(ok=True)
 
 
@@ -755,13 +1020,533 @@ def _plaid_message(exc):
     return str(exc).splitlines()[0][:200]
 
 
+# --------------------------------------------------------------- profiles
+
+def profile_view(pid, config, secrets_store):
+    """One profile as the page needs it.
+
+    Carries the last 4 of the client ID and never the client ID itself or
+    the secret, for the same reason api_state does not: the page has no
+    use for them, and not sending them means they cannot end up in a
+    browser cache or a screenshot."""
+    profile = profiles.profiles(config).get(pid) or {}
+    creds = secrets_store.get(pid) or {}
+    client_id = creds.get("client_id") or ""
+    with_creds = {**profile, "client_id": client_id}
+    sandbox = profile.get("environment") == "sandbox"
+    return {
+        "id": pid,
+        "label": profiles.label(with_creds),
+        "auto_label": profiles.auto_label(with_creds),
+        "nickname": profile.get("nickname"),
+        "environment": profile.get("environment"),
+        "client_id_tail": profiles.client_id_tail(client_id),
+        "has_credentials": bool(client_id and creds.get("secret")),
+        "enabled": bool(profile.get("enabled")),
+        "items": item_summary(profile),
+        "items_created": items_created(profile),
+        # The team's spend, which is what the cap actually applies to.
+        # Zero for sandbox: those Items are free and must never look like
+        # they have eaten into a Trial allowance.
+        "trial_items_used": (
+            0 if sandbox
+            else profiles.trial_items_used(config, secrets_store, client_id)
+        ),
+    }
+
+
+def profiles_payload():
+    config, secrets_store = profiles.read_store()
+    return {
+        "profiles": [
+            profile_view(pid, config, secrets_store)
+            for pid in profiles.profiles(config)
+        ],
+        "trial_item_cap": TRIAL_ITEM_CAP,
+        "trial_items_used": _active_trial_items_used(config, secrets_store),
+        "backups": profiles.list_backups(),
+    }
+
+
+def _active_trial_items_used(config, secrets_store):
+    """Team-wide Items spent for the active profile's client ID, or 0.
+
+    The same number api_state sends, pulled out so the profiles
+    payload can refresh it after an unlink without a full page load.
+    """
+    active = profiles.active(config, secrets_store)
+    if not active or not active.get("client_id"):
+        return 0
+    return profiles.trial_items_used(config, secrets_store, active["client_id"])
+
+
+def verify_credentials(client_id, secret, environment):
+    """Returns an error message, or None when Plaid accepts the pair.
+
+    Creating a link token is the cheapest call that proves credentials
+    work, and it is the same check first-run setup makes."""
+    try:
+        link.new_link_token(
+            link.build_client({
+                "client_id": client_id,
+                "secret": secret,
+                "environment": environment,
+            })
+        )
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return (
+            f"Plaid rejected those credentials ({_plaid_message(e)}). Check "
+            f"the client ID, the secret, and that the secret matches the "
+            f"{environment} environment."
+        )
+    return None
+
+
+# How long to wait for a running fetch before giving up on a change that
+# would alter what gets fetched. Long enough for a real run of a few
+# banks, short enough that the page is not left hanging.
+FETCH_WAIT_SECONDS = 45
+
+
+def wait_for_fetch():
+    """Block while a fetch is in flight.
+
+    Enabling or disabling a profile changes what the next write to
+    data.json should contain, and a fetch that started before the change
+    would finish afterwards and write the old set's numbers over the new
+    ones. Waiting is the simplest correct answer: the alternative is
+    cancelling work that is already paid for in Plaid calls."""
+    import fetch_data
+
+    deadline = time.time() + FETCH_WAIT_SECONDS
+    while fetch_data.fetch_in_progress():
+        if time.time() > deadline:
+            return False
+        time.sleep(0.5)
+    return True
+
+
+def refresh_in_background():
+    """Restart the widget onto the new profile set, then refetch.
+
+    Backgrounded because the page should not sit waiting on Plaid: the
+    switch itself is already done and saved by the time this starts."""
+    def work():
+        ask_widget_to_restart()
+        try:
+            import fetch_data
+
+            fetch_data.main()
+        except (Exception, SystemExit) as e:
+            print(f"[setup] refresh after profile change failed: {e}")
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def backup_profile(config, secrets_store, pid, kind):
+    """A restore point for one profile, taken before anything
+    destructive.
+
+    Includes the secret and every access token on purpose: nothing here
+    ever calls /item/remove, so the Item outlives its local record and a
+    saved token still works. That is what makes a restore able to recover
+    a bank without spending another Plaid Item."""
+    profile = profiles.profiles(config).get(pid) or {}
+    creds = secrets_store.get(pid) or {}
+    label = profiles.label({**profile, "client_id": creds.get("client_id")})
+    return profiles.write_backup(
+        {
+            "kind": kind,
+            "taken": datetime.datetime.now().isoformat(timespec="seconds"),
+            "profile_id": pid,
+            "label": label,
+            "profile": profile,
+            "credentials": creds,
+        },
+        f"{kind}-{label}",
+    )
+
+
+@app.route("/api/profiles")
+def api_profiles():
+    return jsonify(ok=True, **profiles_payload())
+
+
+@app.route("/api/profiles", methods=["POST"])
+def api_profile_add():
+    body = request.get_json(silent=True) or {}
+    client_id = (body.get("client_id") or "").strip()
+    secret = (body.get("secret") or "").strip()
+    environment = (body.get("environment") or "production").strip()
+    nickname = (body.get("nickname") or "").strip() or None
+
+    if not client_id or not secret:
+        return jsonify(ok=False, error="Both the client ID and the secret are required."), 400
+    if environment not in profiles.ENVIRONMENTS:
+        return jsonify(ok=False, error=f"Unknown environment {environment!r}."), 400
+
+    config, secrets_store = profiles.read_store()
+    for pid, profile in profiles.profiles(config).items():
+        creds = secrets_store.get(pid) or {}
+        if (
+            creds.get("client_id") == client_id
+            and profile.get("environment") == environment
+        ):
+            return jsonify(
+                ok=False,
+                error=f"That client ID already has a {environment} profile "
+                      f"({profiles.label({**profile, 'client_id': client_id})}).",
+            ), 400
+
+    error = verify_credentials(client_id, secret, environment)
+    if error:
+        return jsonify(ok=False, error=error), 400
+
+    seed_data_dir()
+    pid = profiles.new_id(config)
+    config.setdefault("profiles", {})[pid] = {
+        "environment": environment,
+        "nickname": nickname,
+        # Added switched off. Enabling changes what the widget draws, and
+        # that should be a separate deliberate click rather than a side
+        # effect of saving a secret.
+        "enabled": False,
+        "items": [],
+        "items_created": 0,
+    }
+    config.setdefault("retired_profile_ids", [])
+    secrets_store[pid] = {"client_id": client_id, "secret": secret}
+    profiles.write_secrets(secrets_store)
+    profiles.write_config(config)
+    print(f"[setup] added profile {pid} ({environment})")
+    return jsonify(ok=True, id=pid, **profiles_payload())
+
+
+@app.route("/api/profiles/<pid>/credentials", methods=["POST"])
+def api_profile_credentials(pid):
+    """Edit a profile in place. Never unlinks its banks.
+
+    An access token is tied to the client ID, not the secret, so a
+    rotated secret keeps working against the same banks. Changing the
+    client ID to a different team is refused rather than silently
+    orphaning them -- that is a new profile, which is what Add is for."""
+    body = request.get_json(silent=True) or {}
+    config, secrets_store = profiles.read_store()
+    profile = profiles.profiles(config).get(pid)
+    if not profile:
+        return jsonify(ok=False, error="No such profile."), 404
+
+    creds = secrets_store.get(pid) or {}
+    client_id = (body.get("client_id") or "").strip() or (creds.get("client_id") or "")
+    secret = (body.get("secret") or "").strip() or (creds.get("secret") or "")
+    if not client_id or not secret:
+        return jsonify(ok=False, error="Both the client ID and the secret are required."), 400
+
+    if (
+        profile.get("items")
+        and creds.get("client_id")
+        and client_id != creds.get("client_id")
+    ):
+        return jsonify(
+            ok=False,
+            error="That profile has linked banks, and their access tokens "
+                  "belong to the current client ID. Add a profile for the "
+                  "other client ID instead.",
+        ), 400
+
+    error = verify_credentials(client_id, secret, profile.get("environment"))
+    if error:
+        return jsonify(ok=False, error=error), 400
+
+    if "nickname" in body:
+        profile["nickname"] = (body.get("nickname") or "").strip() or None
+    secrets_store[pid] = {"client_id": client_id, "secret": secret}
+    profiles.write_secrets(secrets_store)
+    profiles.write_config(config)
+    return jsonify(ok=True, **profiles_payload())
+
+
+@app.route("/api/profiles/<pid>/enabled", methods=["POST"])
+def api_profile_enabled(pid):
+    body = request.get_json(silent=True) or {}
+    want = bool(body.get("enabled"))
+    config, secrets_store = profiles.read_store()
+    profile = profiles.profiles(config).get(pid)
+    if not profile:
+        return jsonify(ok=False, error="No such profile."), 404
+
+    if want:
+        creds = secrets_store.get(pid) or {}
+        if not creds.get("client_id") or not creds.get("secret"):
+            return jsonify(
+                ok=False,
+                error="That profile has no saved credentials yet.",
+            ), 400
+        # Verified before enabling, so the widget never restarts into a
+        # profile that cannot fetch. force=true is the page coming back
+        # after asking whether to enable it anyway.
+        if not body.get("force"):
+            error = verify_credentials(
+                creds["client_id"], creds["secret"], profile.get("environment")
+            )
+            if error:
+                return jsonify(ok=False, error=error, confirmable=True), 400
+
+    if not wait_for_fetch():
+        return jsonify(
+            ok=False,
+            error="A refresh is still running. Try again in a moment.",
+        ), 409
+
+    profile["enabled"] = want
+    disabled = []
+    if want:
+        # Sandbox runs alone. Invented balances summing into a real total
+        # is a mistake that is hard to notice afterwards, so the rule
+        # enforces itself here rather than being reported as an error
+        # after the fact.
+        sandbox = profile.get("environment") == "sandbox"
+        for other_id, other in profiles.profiles(config).items():
+            if other_id == pid or not other.get("enabled"):
+                continue
+            other_sandbox = other.get("environment") == "sandbox"
+            if sandbox or other_sandbox:
+                other["enabled"] = False
+                disabled.append(other_id)
+
+    profiles.write_config(config)
+    refresh_in_background()
+    return jsonify(ok=True, disabled=disabled, **profiles_payload())
+
+
+@app.route("/api/profiles/<pid>/unlink", methods=["POST"])
+def api_profile_unlink(pid):
+    """Drop a profile's linked banks, leaving the profile itself.
+
+    Local only: nothing is sent to Plaid, so this costs no Items and
+    frees none either. On a production profile the Items it spent stay
+    spent, which is why the page says so before asking."""
+    config, secrets_store = profiles.read_store()
+    profile = profiles.profiles(config).get(pid)
+    if not profile:
+        return jsonify(ok=False, error="No such profile."), 404
+
+    backup = backup_profile(config, secrets_store, pid, "before-unlink")
+    before = len(profile.get("items") or [])
+    profile["items"] = []
+    profiles.write_config(config)
+    clear_profile_data(pid)
+    # The merged data.json is what the widget actually draws, and
+    # clear_profile_data only drops this profile's own cache. Without
+    # this the unlinked banks stay on the desktop until the next
+    # scheduled fetch, which can be an hour and a half away.
+    clear_fetched_data()
+    if profile.get("enabled"):
+        refresh_in_background()
+    print(f"[setup] unlinked {before} banks from profile {pid}; backup at {backup}")
+    return jsonify(ok=True, **profiles_payload())
+
+
+@app.route("/api/profiles/<pid>/reset", methods=["POST"])
+def api_profile_reset(pid):
+    """Sandbox only: back to a clean slate for testing.
+
+    Clears the test link count as well as the banks, which production
+    deliberately cannot do -- there the count records Items that are
+    genuinely spent, and zeroing it would be lying about the allowance.
+    Sandbox Items are free, so there is nothing to lie about."""
+    config, secrets_store = profiles.read_store()
+    profile = profiles.profiles(config).get(pid)
+    if not profile:
+        return jsonify(ok=False, error="No such profile."), 404
+    if profile.get("environment") != "sandbox":
+        return jsonify(
+            ok=False,
+            error="Only a sandbox profile can be reset. Its Items are free; "
+                  "production Items stay spent whatever this app forgets.",
+        ), 400
+
+    backup = backup_profile(config, secrets_store, pid, "before-reset")
+    profile["items"] = []
+    profile["items_created"] = 0
+    profiles.write_config(config)
+    clear_profile_data(pid)
+    clear_fetched_data()
+    if profile.get("enabled"):
+        refresh_in_background()
+    print(f"[setup] reset sandbox profile {pid}; backup at {backup}")
+    return jsonify(ok=True, **profiles_payload())
+
+
+@app.route("/api/profiles/<pid>/delete", methods=["POST"])
+def api_profile_delete(pid):
+    config, secrets_store = profiles.read_store()
+    profile = profiles.profiles(config).get(pid)
+    if not profile:
+        return jsonify(ok=False, error="No such profile."), 404
+
+    backup = backup_profile(config, secrets_store, pid, "before-delete")
+    was_enabled = bool(profile.get("enabled"))
+
+    del config["profiles"][pid]
+    # Retired before the files go, so a crash in between cannot leave the
+    # id reusable while its data is already gone.
+    profiles.retire_id(config, pid)
+    secrets_store.pop(pid, None)
+    # Config first here, unlike migrate() and restore: this is the
+    # opposite direction. Dropping the secret first would leave a profile
+    # still listed in config.json with its credentials already gone -- a
+    # zombie that shows in the list, never resolves, and can only be
+    # fixed by typing the secret back in. An orphaned secret, the other
+    # way round, is harmless and is cleaned up by the next write.
+    profiles.write_config(config)
+    profiles.write_secrets(secrets_store)
+    clear_profile_data(pid)
+    # The shared layout keeps the keys of profiles that are switched off,
+    # on purpose. A deleted one is not switched off: its id is retired, so
+    # its keys can never match an account again and nothing would ever
+    # clear them.
+    profiles.drop_layout_keys(pid)
+    for path in (profile_layout_path(pid), profile_snapshot_path(pid)):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    print(f"[setup] deleted profile {pid}; backup at {backup}")
+    if was_enabled:
+        # Cleared, not just refreshed: with no enabled profile left the
+        # fetch exits before writing data.json, deliberately, so a
+        # refresh on its own would leave the deleted profile's balances
+        # on the widget with nothing left to explain them.
+        clear_fetched_data()
+        refresh_in_background()
+    return jsonify(ok=True, **profiles_payload())
+
+
+# ----------------------------------------------------------------- backups
+# A backup holds one profile's credentials and access tokens, which is
+# what lets a restore bring a bank back without spending a Plaid Item.
+# Automatic ones are taken before unlink, reset and delete; manual ones
+# are taken here and never pruned.
+
+@app.route("/api/backups")
+def api_backups():
+    return jsonify(ok=True, backups=profiles.list_backups())
+
+
+@app.route("/api/backups", methods=["POST"])
+def api_backup_create():
+    """A manual backup: one profile, or every profile when none is named.
+
+    One file per profile either way, so a restore never has to pick a
+    profile out of a bundle."""
+    data = request.get_json(silent=True) or {}
+    pid = (data.get("profile_id") or "").strip()
+    config, secrets_store = profiles.read_store()
+    all_profiles = profiles.profiles(config)
+
+    if pid:
+        if pid not in all_profiles:
+            return jsonify(ok=False, error="No such profile."), 404
+        targets = [pid]
+    else:
+        targets = list(all_profiles)
+    if not targets:
+        return jsonify(ok=False, error="There is nothing to back up yet."), 400
+
+    for target in targets:
+        path = backup_profile(config, secrets_store, target, "manual")
+        print(f"[setup] manual backup of profile {target} at {path}")
+    return jsonify(ok=True, saved=len(targets), **profiles_payload())
+
+
+@app.route("/api/backups/<name>/restore", methods=["POST"])
+def api_backup_restore(name):
+    data = request.get_json(silent=True) or {}
+    payload = profiles.read_backup(name)
+    if payload is None:
+        return jsonify(ok=False, error="That backup is missing or unreadable."), 404
+
+    profile, creds = profiles.backup_profile_payload(payload)
+    if not creds.get("client_id") or not creds.get("secret"):
+        return jsonify(
+            ok=False,
+            error="That backup has no saved credentials, so there is nothing to restore.",
+        ), 400
+
+    # Checked before anything is written, so a restore that cannot work
+    # does not leave a dead profile in the list. Refusable rather than
+    # fatal: the access tokens in the backup are still good even when the
+    # secret has been rotated since, and restoring is how you get them
+    # back before fixing the secret.
+    if not data.get("force"):
+        problem = verify_credentials(
+            creds["client_id"], creds["secret"],
+            profile.get("environment") or "production",
+        )
+        if problem:
+            return jsonify(ok=False, error=problem, confirmable=True), 400
+
+    before = set(profiles.profiles())
+    pid = profiles.restore_backup(payload)
+    merged = pid in before
+    print(f"[setup] restored backup {name} into profile {pid}"
+          if merged else f"[setup] restored backup {name} as profile {pid}")
+    if merged:
+        # Its banks went back into the profile that is already there, so
+        # the widget is a fetch behind.
+        clear_fetched_data()
+        refresh_in_background()
+    return jsonify(ok=True, profile_id=pid, merged=merged, **profiles_payload())
+
+
+@app.route("/api/backups/<name>/delete", methods=["POST"])
+def api_backup_delete(name):
+    if not profiles.delete_backup(name):
+        return jsonify(ok=False, error="That backup is missing already."), 404
+    print(f"[setup] deleted backup {name}")
+    return jsonify(ok=True, backups=profiles.list_backups())
+
+
+def clear_profile_data(pid):
+    """Forget one profile's cached balances.
+
+    Separate from clear_fetched_data(), which blanks the merged data.json
+    the widget draws. This only removes the per-profile cache, so the
+    accounts of other profiles are untouched."""
+    try:
+        os.remove(profile_data_path(pid))
+    except OSError:
+        pass
+
+
+def link_target(profile_id):
+    """The profile a link should attach to.
+
+    Named explicitly by the page when more than one profile is enabled,
+    because guessing would quietly put a work bank in the personal
+    profile. Falls back to the active one, which is what the page relies
+    on when there is only one and it therefore asks nothing."""
+    if profile_id:
+        resolved = profiles.resolve(profile_id)
+        if resolved:
+            return resolved
+        return None
+    return profiles.active()
+
+
 @app.route("/api/link_token", methods=["POST"])
 def api_link_token():
-    config = read_config()
+    body = request.get_json(silent=True) or {}
+    config = link_target(body.get("profile_id"))
     if not config:
         return jsonify(ok=False, error="No credentials saved yet."), 400
     try:
-        return jsonify(ok=True, link_token=link.new_link_token(link.build_client(config)))
+        return jsonify(ok=True, link_token=link.new_link_token(
+            link.build_client(config), config.get("environment")
+        ))
     except Exception as e:
         return jsonify(ok=False, error=_plaid_message(e)), 400
 
@@ -769,7 +1554,7 @@ def api_link_token():
 @app.route("/api/exchange", methods=["POST"])
 def api_exchange():
     body = request.get_json(silent=True) or {}
-    config = read_config()
+    config = link_target(body.get("profile_id"))
     if not config:
         return jsonify(ok=False, error="No credentials saved yet."), 400
     try:
@@ -789,18 +1574,41 @@ def api_exchange():
 def api_remove():
     body = request.get_json(silent=True) or {}
     item_id = body.get("item_id")
-    config = read_config()
-    if not config:
-        return jsonify(ok=False, error="Nothing configured."), 400
-    before = len(config.get("items", []))
-    config["items"] = [it for it in config.get("items", []) if it.get("item_id") != item_id]
-    link.save_config(config)
-    print(f"removed item {item_id} ({before} -> {len(config['items'])})")
+    config, secrets_store = profiles.read_store()
+
+    # Found by searching rather than taken from the active profile: with
+    # several enabled, the bank being removed may well belong to another
+    # one, and removing it from whichever profile happens to be active
+    # would delete the wrong token.
+    owner = None
+    for pid, profile in profiles.profiles(config).items():
+        if any(it.get("item_id") == item_id for it in profile.get("items") or []):
+            owner = pid
+            break
+    if owner is None:
+        return jsonify(ok=False, error="No linked bank with that id."), 404
+
+    profile = config["profiles"][owner]
+    before = len(profile.get("items") or [])
+    profile["items"] = [
+        it for it in profile.get("items") or [] if it.get("item_id") != item_id
+    ]
+    profiles.write_config(config)
+    config = profiles.resolve(owner) or {"items": profile["items"]}
+    print(f"removed item {item_id} from {owner} ({before} -> {len(profile['items'])})")
     # The access token is gone from config.json, but Plaid still holds the
     # Item until it's explicitly removed there. Not done automatically:
     # it's irreversible and someone re-adding the same bank in a minute
     # shouldn't be punished for it.
-    return jsonify(ok=True, items=item_summary(config))
+    # items_created deliberately does not come down with this: the Trial
+    # allowance it tracks is spent, and re-linking this bank would spend
+    # another Item rather than reclaim this one.
+    return jsonify(
+        ok=True,
+        items=item_summary(config),
+        items_created=items_created(config),
+        **profiles_payload(),
+    )
 
 
 @app.route("/api/verify", methods=["POST"])
@@ -1543,6 +2351,53 @@ PAGE = r"""<!doctype html>
     padding: .55rem .7rem; background: var(--card-2); border-radius: 8px; margin-bottom: .4rem;
   }
   ul.banks .none { color: var(--faint); background: none; padding-left: 0; }
+  /* A profile row: a tick to enable it, its name, and a chevron that opens
+     the same fields Add uses. Bordered rather than striped, because an
+     expanded row has to stay visibly one thing while it is twice the
+     height of its neighbours. */
+  .prof { border: 1px solid var(--line); border-radius: .45rem; margin: .4rem 0; }
+  .prof .top {
+    display: flex; align-items: center; gap: .55rem;
+    padding: .5rem .6rem; cursor: default;
+  }
+  .prof .top .name { font-weight: 500; }
+  .prof .top .tail { color: var(--faint); font-variant-numeric: tabular-nums; }
+  .prof .top .count { margin-left: auto; color: var(--dim); font-size: .88em; }
+  /* A fixed square that centres its own icon, rather than a text button
+     whose glyph sits wherever the font's baseline puts it: the row is
+     align-items:center, so centring the box was never the problem, the
+     glyph inside it was. Same stroked-SVG idiom as the tab icons. */
+  .prof .chev {
+    background: none; border: 0; color: var(--dim); padding: 0;
+    width: 1.5rem; height: 1.5rem; flex: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .prof .chev svg {
+    width: .8rem; height: .8rem; display: block;
+    transition: transform .15s ease;
+  }
+  .prof .chev.open svg { transform: rotate(180deg); }
+  .prof .body { padding: 0 .6rem .6rem; border-top: 1px solid var(--hair); }
+  .prof .body .fields { margin-top: .6rem; }
+  .prof .acts { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
+  .prof.off .top .name, .prof.off .top .tail { color: var(--dim); }
+  .prof .cap { color: var(--bad); font-size: .88em; margin: .35rem 0 0; }
+  .grp2 { margin: 1.2rem 0 .2rem; font-size: .95em; }
+  /* Which profile a row belongs to. Same job as .profile-tag on the
+     widget and the same quietness: with one profile enabled it is never
+     drawn at all. */
+  .plab { margin-left: .4rem; color: var(--faint); font-size: .85em; }
+  /* Backups are a log, not settings: one line each, newest first, with
+     the actions on the right where they do not interrupt the scan. */
+  .bk {
+    display: flex; align-items: center; gap: .5rem; padding: .35rem .1rem;
+    border-bottom: 1px solid var(--hair); font-size: .9em;
+  }
+  .bk:last-child { border-bottom: 0; }
+  .bk .when { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .bk .what { color: var(--faint); }
+  .bk .acts { margin-left: auto; display: flex; gap: .3rem; }
+  .bk button { font-size: .9em; padding: .18rem .45rem; }
   code { background: var(--card-2); padding: .1rem .35rem; border-radius: 4px;
          font-size: .85em; color: var(--dim); word-break: break-all; }
   a { color: var(--accent); }
@@ -1789,20 +2644,48 @@ PAGE = r"""<!doctype html>
   <section id="tab-accounts" hidden>
     <h2><span class="num">&#10003;</span> Linked banks</h2>
     <p class="hint">
-      Add another bank, or remove one. Removing one forgets it here but
+      Add another bank, or remove one. Removing one forgets it here and
       leaves the bank linked at Plaid, so adding it back later is just
-      another sign-in. The account list is what the last fetch returned,
-      grouped into the sections the widget draws them in; new banks join it
-      after the next refresh.
+      another sign-in &ndash; but on the free Trial plan that sign-in spends
+      another of your 10 banks rather than reusing the old one. The account
+      list is what the last fetch returned, grouped into the sections the
+      widget draws them in; new banks join it after the next refresh.
     </p>
     <div class="body">
       <div class="split">
         <div>
           <ul class="banks" id="bankList"></ul>
+          <p class="hint2" id="trialUse"></p>
+          <p class="hint2" id="sandboxCreds" hidden>
+            Sandbox: phone <code>+14155550138</code> (prefilled), code
+            <code>123456</code>, then <code>user_good</code> /
+            <code>pass_good</code> &ndash; or <code>user_loan_loc</code> for
+            a credit card with a due date.
+          </p>
+          <!-- Hidden unless two or more profiles are enabled: with one
+               there is nothing to choose, and an unnecessary question
+               about a concept you are not using is worse than silence. -->
+          <div class="row" id="linkTarget" hidden></div>
           <div class="row">
             <button class="solid" id="addBank">Add a bank</button>
             <button id="reinstall">Redo shortcuts</button>
-            <button id="launchNow">Launch widget</button>
+            <!-- Plain, not solid: "Add a bank" is the one thing this tab is
+                 for, and two filled buttons in a row argue over which. -->
+            <span class="menu-root">
+              <span class="btn-group">
+                <button id="reloadWidget">Reload widget</button>
+                <button id="reloadMenuBtn" aria-haspopup="menu"
+                        aria-expanded="false" aria-label="More reload options">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="m6 9 6 6 6-6"/>
+                  </svg>
+                </button>
+              </span>
+              <div class="menu" id="reloadMenu" role="menu" hidden>
+                <button role="menuitem" id="reloadRestart">Reload and Restart</button>
+              </div>
+            </span>
           </div>
           <p class="hint" id="notInstalled" hidden style="margin:.9rem 0 0">
             Not installed yet, so there's no Start-menu shortcut either.
@@ -1827,47 +2710,62 @@ PAGE = r"""<!doctype html>
       <h3 class="grp">Advanced</h3>
       <div class="check" style="margin-top:.3rem">
         <input type="checkbox" id="advToggle">
-        <label for="advToggle" style="margin:0">Show Plaid credentials and environment</label>
+        <label for="advToggle" style="margin:0">Show/Add Plaid profiles</label>
       </div>
       <div id="advanced" hidden>
-        <p class="hint2 warn">
-          Saving here unlinks every bank. An access token only works for the
-          client ID and environment it was created under, so banks linked
-          under the old ones would error on every fetch instead of carrying
-          over. You'll re-link them from this tab afterwards.
+        <p class="hint2">
+          A profile is one Plaid client ID in one environment. Tick the ones
+          to draw. Sandbox runs on its own.
         </p>
-        <!-- The same three credentials as step 1, so the same stacked
-             shape: this is a form you fill in, not a row of settings you
-             scan. -->
-        <div class="narrow">
+        <div id="profileList"></div>
+        <div class="foot">
+          <div class="msg" id="advMsg"></div>
+          <button id="addProfile">Add profile</button>
+        </div>
+        <!-- Same stacked shape as step 1, because this is a form you fill
+             in rather than a row of settings you scan. -->
+        <div class="narrow" id="newProfile" hidden>
           <div class="fields">
             <div class="field">
-              <label for="advEnv">Environment</label>
-              <select id="advEnv">
+              <label for="npEnv">Environment</label>
+              <select id="npEnv">
                 <option value="production">production</option>
                 <option value="sandbox">sandbox</option>
               </select>
             </div>
             <div class="field">
-              <label for="advClientId">Client ID</label>
-              <input type="text" id="advClientId" autocomplete="off" spellcheck="false">
-              <span class="sub2">Leave blank to keep the saved one</span>
+              <label for="npNick">Nickname (Optional)</label>
+              <input type="text" id="npNick" autocomplete="off" spellcheck="false"
+                     placeholder="work">
             </div>
             <div class="field">
-              <label for="advSecret">Secret</label>
-              <input type="password" id="advSecret" autocomplete="off" spellcheck="false">
-              <span class="sub2">Leave blank to keep the saved one</span>
+              <label for="npClientId">Client ID</label>
+              <input type="text" id="npClientId" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="field">
+              <label for="npSecret">Secret</label>
+              <input type="password" id="npSecret" autocomplete="off" spellcheck="false">
             </div>
           </div>
-          <p class="hint2">
-            These start blank on purpose: setup never sends your saved
-            credentials back to the page, so they can't end up in a browser
-            cache or a screenshot.
-          </p>
           <div class="foot">
-            <div class="msg" id="advMsg"></div>
-            <button class="solid" id="saveAdvanced">Save and unlink banks</button>
+            <div class="msg" id="npMsg"></div>
+            <div>
+              <button id="cancelProfile">Cancel</button>
+              <button class="solid" id="saveProfile">Add</button>
+            </div>
           </div>
+        </div>
+
+        <h4 class="grp2">Backups</h4>
+        <p class="hint2">
+          A backup holds a profile's secret and its bank tokens, so
+          restoring brings its banks back without spending Plaid Items.
+          Taken automatically before unlink, reset and delete.
+        </p>
+        <div id="backupList"></div>
+        <div class="foot">
+          <div class="msg" id="bkMsg"></div>
+          <button id="backupNow">Back up now</button>
         </div>
       </div>
     </div>
@@ -1929,6 +2827,7 @@ PAGE = r"""<!doctype html>
             </span>
             <div class="menu" id="saveMenu" role="menu" hidden>
               <button role="menuitem" id="saveRestart">Save and Restart</button>
+              <button role="menuitem" id="saveReloadRestart">Reload and Restart</button>
             </div>
           </span>
         </span>
@@ -1945,6 +2844,23 @@ PAGE = r"""<!doctype html>
       <a href="https://dashboard.plaid.com" target="_blank" rel="noopener">Plaid</a>,
       and uses your own Plaid account rather than someone else's. Create one,
       then copy the client ID and secret from the dashboard's Keys page.
+    </p>
+    <p class="hint2">
+      A new Plaid account starts on the free <strong>Trial plan</strong>,
+      which covers both the things this widget reads &ndash; balances and
+      credit card details &ndash; at no cost. It allows
+      <strong>10 linked banks in total</strong>, and that total counts every
+      bank you ever link: removing one here does not give the slot back. Link
+      the banks you actually want and you will not run out, but there is no
+      free way to undo a bank linked by mistake.
+    </p>
+    <p class="hint2">
+      <strong>Already had a Plaid account before April 2026?</strong> It is on
+      an older plan that asks you to apply for production access, and it
+      cannot be moved onto the Trial plan. Make a new team instead &ndash;
+      team switcher at the top left of the dashboard, then Teams, then Create
+      team &ndash; and use that team's keys here. A team made today starts on
+      Trial with no application to fill in.
     </p>
     <div class="body">
       <div class="fields">
@@ -1980,6 +2896,37 @@ PAGE = r"""<!doctype html>
       DesktopCards.
     </p>
     <div class="body">
+      <!-- Sandbox only: Plaid's fake bank wants credentials like a real one,
+           and they are not guessable. Shown in place rather than linked to
+           the docs, because needing them is the one moment you cannot go
+           and read anything. -->
+      <div id="sandboxHelp" hidden>
+        <h3 class="grp" style="margin-top:0">Sandbox test credentials</h3>
+        <p class="hint2">
+          Plaid's fake bank will ask for these. The phone number is already
+          filled in for you &ndash; it picks the <em>OAuth Multi-item</em>
+          profile, the busiest one, so the link runs through an OAuth
+          hand-off and a bank with several accounts. Plaid masks it to the
+          last four digits, so expect to see only <code>&bull;&bull;&bull;&bull; 0138</code>.
+        </p>
+        <p class="hint2">
+          Plaid's own window suggests a different test number in a banner of
+          its own. Ignore it &ndash; that banner is inside Plaid's window and
+          nothing here can change it, and the number already in the box is
+          the one that gets used.
+        </p>
+        <ul class="hint2" style="margin:.4rem 0 0; padding-left:1.1rem">
+          <li>Phone &ndash; <code>+14155550138</code></li>
+          <li>One-time code &ndash; <code>123456</code></li>
+          <li>Username &ndash; <code>user_good</code></li>
+          <li>Password &ndash; <code>pass_good</code></li>
+          <li>
+            For a credit card with a payment due date, link a second bank
+            with <code>user_loan_loc</code> instead of
+            <code>user_good</code>.
+          </li>
+        </ul>
+      </div>
       <ul class="banks" id="linkedSoFar"></ul>
       <div class="foot">
         <div class="msg" id="linkMsg"></div>
@@ -2150,7 +3097,14 @@ async function api(path, body) {
   });
   let data = {};
   try { data = await res.json(); } catch (e) {}
-  if (!res.ok) throw new Error(data.error || ('Request failed (' + res.status + ')'));
+  if (!res.ok) {
+    const err = new Error(data.error || ('Request failed (' + res.status + ')'));
+    // The rest of the body comes with it, so a caller can branch on a
+    // flag the server set -- confirmable, say -- rather than matching on
+    // the wording of the message.
+    Object.assign(err, data);
+    throw err;
+  }
   return data;
 }
 
@@ -2164,6 +3118,53 @@ function step(id, state) {
   el.hidden = state === 'hidden';
   el.classList.toggle('active', state === 'active');
   el.classList.toggle('done', state === 'done');
+}
+
+// How much of the free Trial allowance this Plaid account has spent.
+// Informational only: a paid plan lifts the cap and nothing here can tell
+// which plan the client_id is on, so this never blocks linking -- it just
+// stops the 10-bank limit being a surprise discovered at the 11th bank.
+function renderTrialUse() {
+  const el = $('trialUse');
+  if (!el) return;
+  // Nothing to report in sandbox: its Items are unlimited and free, and
+  // none of them touch the Production allowance this is counting.
+  if (STATE.environment === 'sandbox') { el.hidden = true; return; }
+  el.hidden = false;
+  const cap = STATE.trial_item_cap || 10;
+  // The team's spend, not this profile's: the sentence below names
+  // the per-team allowance, so the number has to match it.
+  const used = STATE.trial_items_used || STATE.items_created || 0;
+  const left = Math.max(0, cap - used);
+  const linked = (STATE.items || []).length;
+  // Both numbers and nothing inferred from the gap between them: the
+  // count is a local tally of Items ever created, Plaid has no API for it,
+  // and it is hand-editable, so why it differs from what is linked now is
+  // not something this can know. Says nothing about which plan either,
+  // for the same reason.
+  let text = used + ' of ' + cap + ' Plaid banks used';
+  if (used > linked) text += ' (' + linked + ' linked now)';
+  text += left
+    ? '. Trial allows ' + cap + ' per Plaid team, for its lifetime.'
+    : '. If you are still on Trial, linking another will be refused.';
+  el.textContent = text;
+  el.className = left <= 2 ? 'hint2 warn' : 'hint2';
+}
+
+// Every linked bank across the enabled profiles, so the Accounts tab
+// lists what the widget actually draws rather than one profile's share of
+// it. Labelled only when there are two or more to tell apart.
+function allLinkedBanks() {
+  const on = enabledProfiles();
+  if (!on.length) return STATE.items || [];
+  const many = on.length > 1;
+  const out = [];
+  for (const p of on) {
+    for (const it of p.items || []) {
+      out.push(Object.assign({}, it, { profile_label: many ? p.label : null }));
+    }
+  }
+  return out;
 }
 
 function renderBanks(ul, items, removable) {
@@ -2180,6 +3181,12 @@ function renderBanks(ul, items, removable) {
     const name = document.createElement('span');
     name.textContent = it.institution_name;
     li.append(name);
+    if (it.profile_label) {
+      const who = document.createElement('span');
+      who.className = 'tail';
+      who.textContent = '·' + it.profile_label;
+      li.append(who);
+    }
     if (removable) {
       const btn = document.createElement('button');
       btn.className = 'danger';
@@ -2189,7 +3196,12 @@ function renderBanks(ul, items, removable) {
         try {
           const r = await api('/api/remove', { item_id: it.item_id });
           STATE.items = r.items;
-          renderBanks(ul, r.items, removable);
+          if (r.items_created !== undefined) STATE.items_created = r.items_created;
+          if (r.profiles) STATE.profiles = r.profiles;
+          renderBanks(ul, allLinkedBanks(), removable);
+          renderProfiles();
+          renderLinkTarget();
+          renderTrialUse();
           say($('manageMsg'), 'Removed. The widget picks that up on its next refresh.', 'ok');
         } catch (e) { say($('manageMsg'), e.message, 'bad'); btn.disabled = false; }
       };
@@ -2223,9 +3235,6 @@ function renderGroups(groups) {
     return;
   }
   for (const g of nonEmpty) {
-    // "other" has no order or hidden list behind it in appearance.json, so
-    // there's nothing for a toggle in this section to write into.
-    const locked = g.type === 'other';
     const rows = [];
 
     const h = document.createElement('h3');
@@ -2234,7 +3243,6 @@ function renderGroups(groups) {
 
     const all = document.createElement('input');
     all.type = 'checkbox';
-    all.disabled = locked;
     all.setAttribute('aria-label', 'Show every account in this section');
 
     const count = document.createElement('span');
@@ -2270,7 +3278,6 @@ function renderGroups(groups) {
       // way it wrapped the old single-row layout.
       box.id = 'acct:' + g.type + ':' + a.key;
       box.checked = !a.hidden;
-      box.disabled = locked;
       // Present means the widget draws it -- the row styling keys off this
       // one attribute rather than a class of its own.
       const mark = () => tr.toggleAttribute('data-selected', box.checked);
@@ -2294,7 +3301,7 @@ function renderGroups(groups) {
           box.checked = !box.checked;
           say($('manageMsg'), e.message, 'bad');
         }
-        box.disabled = locked;
+        box.disabled = false;
         syncHead();
       };
 
@@ -2307,6 +3314,12 @@ function renderGroups(groups) {
       lab.setAttribute('for', box.id);
       lab.textContent = a.institution_name;
       who.append(lab);
+      if (a.profile_label) {
+        const tag = document.createElement('span');
+        tag.className = 'plab';
+        tag.textContent = a.profile_label;
+        who.append(tag);
+      }
 
       const what = document.createElement('td');
       what.className = 'what';
@@ -2335,8 +3348,8 @@ function renderGroups(groups) {
           done++;
         } catch (e) { failed = e; break; }
       }
-      for (const r of rows) r.box.disabled = locked;
-      all.disabled = locked;
+      for (const r of rows) r.box.disabled = false;
+      all.disabled = false;
       syncHead();
       if (failed) {
         say($('manageMsg'), failed.message, 'bad');
@@ -2395,8 +3408,12 @@ async function loadState() {
     showTab(document.querySelector('.tab.on').dataset.tab);
     $('autostartManage').checked = STATE.autostart;
     $('notInstalled').hidden = STATE.installed;
-    if (STATE.environment) $('advEnv').value = STATE.environment;
-    renderBanks($('bankList'), STATE.items, true);
+    renderProfiles();
+    renderLinkTarget();
+    renderBackups();
+    renderBanks($('bankList'), allLinkedBanks(), true);
+    renderTrialUse();
+    $('sandboxCreds').hidden = STATE.environment !== 'sandbox';
     renderGroups(STATE.groups);
   } else {
     $('subtitle').textContent = 'Five steps, about two minutes.';
@@ -2412,7 +3429,10 @@ async function loadState() {
   // relabel(), not textContent: a loadState() that lands while one of
   // these is mid-restart would otherwise write over the spinner's
   // "Restarting…" and then have loaded() put the stale old label back.
-  relabel($('launchNow'), STATE.running ? 'Restart widget' : 'Launch widget');
+  // The menu option launches rather than restarts when nothing is running,
+  // and /api/launch already does both -- so only the wording moves.
+  relabel($('reloadRestart'),
+          STATE.running ? 'Reload and Restart' : 'Reload and Launch');
   relabel($('launch'), STATE.running ? 'Restart DesktopCards' : 'Launch DesktopCards');
 }
 
@@ -2430,6 +3450,10 @@ $('saveCreds').onclick = async () => {
     say($('credsMsg'), 'Credentials work.', 'ok');
     step('s1', 'done');
     step('s2', 'active');
+    // Read from the form, not STATE: the environment was only just saved
+    // and STATE is from page load, so it still says whatever was there
+    // before (usually nothing, on a first run).
+    $('sandboxHelp').hidden = $('environment').value !== 'sandbox';
     renderBanks($('linkedSoFar'), [], false);
   } catch (e) {
     say($('credsMsg'), e.message, 'bad');
@@ -2446,8 +3470,14 @@ let linkOpen = false;
 async function runLink(msgEl, onDone) {
   say(msgEl, 'Opening Plaid…');
   let token;
+  // Both declared out here on purpose: onSuccess below runs long after
+  // this try block has ended, and it needs the same profile the token was
+  // made for -- the bank has to be saved against the profile that asked
+  // for it, not whichever one is selected by the time Plaid comes back.
+  let target;
   try {
-    token = (await api('/api/link_token', {})).link_token;
+    target = linkTargetId();
+    token = (await api('/api/link_token', { profile_id: target })).link_token;
   } catch (e) { say(msgEl, e.message, 'bad'); return; }
 
   linkOpen = true;
@@ -2459,6 +3489,7 @@ async function runLink(msgEl, onDone) {
       try {
         const r = await api('/api/exchange', {
           public_token,
+          profile_id: target,
           institution_name: metadata.institution ? metadata.institution.name : 'Unknown',
           institution_id: metadata.institution ? metadata.institution.institution_id : null,
         });
@@ -2570,51 +3601,523 @@ $('reinstall').onclick = async () => {
 // Same work, from the checkbox rather than the button -- so it spins the
 // button too, which is where the result shows up.
 $('autostartManage').onchange = () => $('reinstall').onclick();
-$('launchNow').onclick = async () => {
-  const btn = $('launchNow');
-  loading(btn, STATE.running ? 'Restarting…' : 'Starting…');
-  say($('manageMsg'), 'Starting…');
+// Pull fresh balances, and on the menu option restart the widget after.
+// Same order as the Appearance tab's version and for the same reason: the
+// widget reads data.json as it comes up, so fetching first means it draws
+// the new balances immediately rather than the previous ones.
+async function reloadWidget(restart) {
+  const btn = $('reloadWidget'), chevron = $('reloadMenuBtn');
+  loading(btn, 'Reloading…');
+  chevron.disabled = true;
+  say($('manageMsg'), 'Fetching balances…');
+
+  let accounts = null;
+  try {
+    const r = await api('/api/verify', {});
+    accounts = r.accounts;
+    if (r.errors && r.errors.length) {
+      say($('manageMsg'), 'Fetched with ' + r.errors.length + ' error' +
+        (r.errors.length === 1 ? '' : 's') + ': ' + r.errors.join('; '), 'bad');
+    } else {
+      say($('manageMsg'), 'Got ' + accounts + ' account' +
+        (accounts === 1 ? '' : 's') + '.', 'ok');
+    }
+  } catch (e) {
+    say($('manageMsg'), e.message, 'bad');
+    loaded(btn); chevron.disabled = false;
+    return;
+  }
+
+  if (!restart) {
+    // The fetch can add or drop accounts, so the lists on this tab are
+    // stale the moment it returns.
+    loaded(btn); chevron.disabled = false; loadState();
+    return;
+  }
+
+  loading(btn, 'Restarting…');
   try {
     const r = await api('/api/launch', {});
     say($('manageMsg'), r.action === 'restarted'
-      ? 'Restarted the running widget.'
-      : 'Launched. Look for the icon in your system tray.', 'ok');
-    // The restart takes a moment to come back up; re-read after it has, so
-    // the button label reflects reality rather than the instant mid-restart.
-    // The spinner stays up for that wait too: it's the same operation
-    // finishing, and loadState() is what retitles the button.
-    setTimeout(() => { loaded(btn); loadState(); }, 4000);
+      ? 'Reloaded and restarted the widget.'
+      : 'Reloaded. Launched the widget – look for the icon in your system tray.', 'ok');
+  } catch (e) {
+    say($('manageMsg'), 'Reloaded, but the restart failed: ' + e.message, 'bad');
+  }
+  // The restart takes a moment to come back up; re-read after it has, so
+  // the tab reflects reality rather than the instant mid-restart.
+  setTimeout(() => { loaded(btn); chevron.disabled = false; loadState(); }, 4000);
+}
+
+$('reloadWidget').onclick = () => reloadWidget(false);
+$('reloadRestart').onclick = () => reloadWidget(true);
+wireMenu('reloadMenuBtn', 'reloadMenu');
+
+// ------------------------------------------------------------- profiles
+// A profile is one Plaid client ID in one environment. Several can be
+// enabled at once, which is what puts work and personal accounts on one
+// widget; enabling a sandbox profile switches the whole widget to test
+// data, on its own.
+$('advToggle').onchange = () => { $('advanced').hidden = !$('advToggle').checked; };
+
+function applyProfiles(r) {
+  if (r && r.backups) STATE.backups = r.backups;
+  if (r && r.profiles) STATE.profiles = r.profiles;
+  if (r && r.trial_item_cap) STATE.trial_item_cap = r.trial_item_cap;
+  if (r && r.trial_items_used !== undefined) STATE.trial_items_used = r.trial_items_used;
+  renderProfiles();
+  renderLinkTarget();
+  // Unlink, reset and delete each take a backup, so the list below has
+  // changed by the time any of them come back.
+  renderBackups();
+  // The bank list and the Trial count come from the profiles too.
+  // Leaving them stale made an unlink look like it had not happened.
+  renderBanks($('bankList'), allLinkedBanks(), true);
+  renderTrialUse();
+}
+
+function profileCount(p) {
+  const cap = STATE.trial_item_cap || 10;
+  const banks = (p.items || []).length;
+  const label = banks + (banks === 1 ? ' bank' : ' banks');
+  // Sandbox Items are free and unlimited, so counting them against a cap
+  // would be inventing a limit that does not exist.
+  if (p.environment === 'sandbox') {
+    return label + ' · ' + p.items_created + ' test links';
+  }
+  return label + ' · ' + p.trial_items_used + ' of ' + cap + ' Items used';
+}
+
+function profileBody(p) {
+  const wrap = document.createElement('div');
+  const fields = document.createElement('div');
+  fields.className = 'fields';
+  fields.innerHTML =
+    '<div class="field"><label>Nickname (Optional)</label>' +
+    '<input type="text" class="pNick" autocomplete="off" spellcheck="false"></div>' +
+    '<div class="field"><label>Client ID</label>' +
+    '<input type="text" class="pClient" autocomplete="off" spellcheck="false">' +
+    '<span class="sub2">Leave blank to keep the saved one</span></div>' +
+    '<div class="field"><label>Secret</label>' +
+    '<input type="password" class="pSecret" autocomplete="off" spellcheck="false">' +
+    '<span class="sub2">Leave blank to keep the saved one</span></div>';
+  const nick = fields.querySelector('.pNick');
+  const client = fields.querySelector('.pClient');
+  const secret = fields.querySelector('.pSecret');
+  nick.value = p.nickname || '';
+  // The saved credentials are never sent back to the page, so the field
+  // shows only what the server will admit to: the last 4.
+  client.placeholder = p.client_id_tail ? '••••••••' + p.client_id_tail : '';
+  wrap.append(fields);
+
+  const msg = document.createElement('div');
+  msg.className = 'msg';
+  wrap.append(msg);
+
+  const acts = document.createElement('div');
+  acts.className = 'acts';
+
+  const save = document.createElement('button');
+  save.className = 'solid';
+  save.textContent = 'Save';
+  save.onclick = async () => {
+    loading(save, 'Checking…');
+    try {
+      const r = await api('/api/profiles/' + p.id + '/credentials', {
+        nickname: nick.value,
+        client_id: client.value,
+        secret: secret.value,
+      });
+      client.value = '';
+      secret.value = '';
+      applyProfiles(r);
+      say($('advMsg'), 'Saved. Your linked banks are untouched.', 'ok');
+    } catch (e) {
+      say(msg, e.message, 'bad');
+    }
+    loaded(save);
+  };
+  acts.append(save);
+
+  const banks = (p.items || []).length;
+  if (banks) {
+    const unlink = document.createElement('button');
+    unlink.className = 'danger';
+    unlink.textContent = 'Unlink banks';
+    unlink.onclick = async () => {
+      // Said plainly, because it is the part people get wrong: removing a
+      // bank here does not give a Plaid Item back.
+      const warn = 'Unlink ' + banks + (banks === 1 ? ' bank' : ' banks') +
+        ' from ' + p.label + '?\n\nA backup is saved first.' +
+        (p.environment === 'sandbox' ? ''
+          : '\n\nIts Items stay spent on Plaid. Re-linking costs new ones.');
+      if (!confirm(warn)) return;
+      unlink.disabled = true;
+      try {
+        applyProfiles(await api('/api/profiles/' + p.id + '/unlink', {}));
+        say($('advMsg'), 'Unlinked. A backup was saved first.', 'ok');
+      } catch (e) { say(msg, e.message, 'bad'); unlink.disabled = false; }
+    };
+    acts.append(unlink);
+  }
+
+  if (p.environment === 'sandbox') {
+    const reset = document.createElement('button');
+    reset.textContent = 'Reset sandbox';
+    reset.onclick = async () => {
+      if (!confirm('Reset ' + p.label + '?\n\nClears its test link count, ' +
+                   'unlinks its banks and drops its cached balances. ' +
+                   'Sandbox Items are free, so this costs nothing.')) return;
+      reset.disabled = true;
+      try {
+        applyProfiles(await api('/api/profiles/' + p.id + '/reset', {}));
+        say($('advMsg'), 'Sandbox reset.', 'ok');
+      } catch (e) { say(msg, e.message, 'bad'); reset.disabled = false; }
+    };
+    acts.append(reset);
+  }
+
+  const del = document.createElement('button');
+  del.className = 'danger';
+  del.textContent = 'Delete profile';
+  del.onclick = async () => {
+    let warn = 'Delete ' + p.label + '?\n\nRemoves its saved secret, its ' +
+      banks + (banks === 1 ? ' linked bank' : ' linked banks') +
+      ' and its cached balances. A backup is saved first.';
+    if (p.environment !== 'sandbox' && p.items_created) {
+      warn += '\n\nIts Items stay spent on Plaid. Deleting does not give ' +
+        'the slots back.';
+    }
+    if (!confirm(warn)) return;
+    del.disabled = true;
+    try {
+      applyProfiles(await api('/api/profiles/' + p.id + '/delete', {}));
+      say($('advMsg'), 'Deleted. A backup was saved first.', 'ok');
+    } catch (e) { say(msg, e.message, 'bad'); del.disabled = false; }
+  };
+  acts.append(del);
+
+  wrap.append(acts);
+  return wrap;
+}
+
+async function setProfileEnabled(p, tick) {
+  const want = tick.checked;
+  tick.disabled = true;
+  say($('advMsg'), want ? 'Checking with Plaid…' : 'Saving…');
+  try {
+    let r;
+    try {
+      r = await api('/api/profiles/' + p.id + '/enabled', { enabled: want });
+    } catch (e) {
+      // Plaid refused this profile's secret. Enabling anyway is exactly
+      // what you want when the reason you are enabling it is to fix it,
+      // so this asks rather than deciding.
+      if (e.confirmable && confirm(e.message + '\n\nEnable it anyway?')) {
+        r = await api('/api/profiles/' + p.id + '/enabled',
+                      { enabled: want, force: true });
+      } else {
+        throw e;
+      }
+    }
+    const off = (r.disabled || []).length;
+    applyProfiles(r);
+    say($('advMsg'), want
+      ? 'Enabled.' + (off ? ' Sandbox runs alone, so the rest were switched off.' : '') +
+        ' Restarting the widget and refreshing…'
+      : 'Disabled. Restarting the widget…', 'ok');
+  } catch (e) {
+    tick.checked = !want;
+    say($('advMsg'), e.message, 'bad');
+  }
+  tick.disabled = false;
+}
+
+function profileRow(p) {
+  const cap = STATE.trial_item_cap || 10;
+  const row = document.createElement('div');
+  row.className = 'prof' + (p.enabled ? '' : ' off');
+
+  const top = document.createElement('div');
+  top.className = 'top';
+
+  const tick = document.createElement('input');
+  tick.type = 'checkbox';
+  tick.checked = !!p.enabled;
+  tick.disabled = !p.has_credentials;
+  tick.onchange = () => setProfileEnabled(p, tick);
+  top.append(tick);
+
+  const name = document.createElement('span');
+  name.className = 'name';
+  name.textContent = p.label;
+  top.append(name);
+
+  // Only when a nickname is hiding them: the nickname is what you call
+  // this profile, the environment and tail are what Plaid calls it, and
+  // with two teams in the list you need both.
+  if (p.nickname) {
+    const tail = document.createElement('span');
+    tail.className = 'tail';
+    tail.textContent = p.environment +
+      (p.client_id_tail ? ' ·' + p.client_id_tail : '');
+    top.append(tail);
+  }
+
+  const count = document.createElement('span');
+  count.className = 'count';
+  count.textContent = profileCount(p);
+  top.append(count);
+
+  const chev = document.createElement('button');
+  chev.className = 'chev';
+  chev.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" ' +
+    'aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
+  chev.title = 'Edit';
+  top.append(chev);
+  row.append(top);
+
+  if (p.environment !== 'sandbox' && p.trial_items_used >= cap) {
+    const note = document.createElement('p');
+    note.className = 'cap';
+    // Never claims which plan this team is on, because nothing here can
+    // tell: Plaid has no API for the count or the plan.
+    note.textContent = 'Trial allows ' + cap + ' per Plaid team for its ' +
+      'lifetime. If you are still on Trial, new production links will be refused.';
+    row.append(note);
+  }
+
+  const body = document.createElement('div');
+  body.className = 'body';
+  body.hidden = true;
+  body.append(profileBody(p));
+  chev.onclick = () => {
+    body.hidden = !body.hidden;
+    chev.classList.toggle('open', !body.hidden);
+  };
+  row.append(body);
+  return row;
+}
+
+function renderProfiles() {
+  const list = $('profileList');
+  if (!list) return;
+  list.innerHTML = '';
+  const all = STATE.profiles || [];
+  if (!all.length) {
+    const none = document.createElement('p');
+    none.className = 'hint2';
+    none.textContent = 'No profiles yet.';
+    list.append(none);
     return;
-  } catch (e) { say($('manageMsg'), e.message, 'bad'); }
+  }
+  for (const p of all) list.append(profileRow(p));
+}
+
+// ---- adding one
+$('addProfile').onclick = () => {
+  $('newProfile').hidden = false;
+  $('addProfile').hidden = true;
+  say($('npMsg'), '');
+};
+
+$('cancelProfile').onclick = () => {
+  $('newProfile').hidden = true;
+  $('addProfile').hidden = false;
+  for (const id of ['npNick', 'npClientId', 'npSecret']) $(id).value = '';
+};
+
+$('saveProfile').onclick = async () => {
+  const btn = $('saveProfile');
+  loading(btn, 'Checking…');
+  say($('npMsg'), 'Checking with Plaid…');
+  try {
+    const r = await api('/api/profiles', {
+      nickname: $('npNick').value,
+      client_id: $('npClientId').value,
+      secret: $('npSecret').value,
+      environment: $('npEnv').value,
+    });
+    for (const id of ['npNick', 'npClientId', 'npSecret']) $(id).value = '';
+    $('newProfile').hidden = true;
+    $('addProfile').hidden = false;
+    applyProfiles(r);
+    say($('advMsg'), 'Added, switched off. Tick it to draw its accounts.', 'ok');
+  } catch (e) {
+    say($('npMsg'), e.message, 'bad');
+  }
   loaded(btn);
 };
 
-// ------------------------------------------------------------- advanced
-$('advToggle').onchange = () => { $('advanced').hidden = !$('advToggle').checked; };
+// ---- which profile a new bank goes into
+// Asked only when there is something to ask: with one profile enabled the
+// Accounts tab looks exactly as it did before profiles existed.
+function enabledProfiles() {
+  return (STATE.profiles || []).filter(p => p.enabled && p.has_credentials);
+}
 
-$('saveAdvanced').onclick = async () => {
-  const banks = (STATE.items || []).length;
-  const warning = banks
-    ? 'This unlinks ' + banks + ' bank' + (banks === 1 ? '' : 's') +
-      ' and you will have to link them again. Continue?'
-    : 'Save these credentials?';
-  if (!confirm(warning)) return;
-  const btn = $('saveAdvanced');
+function linkTargetId() {
+  const picked = document.querySelector('input[name="linkTarget"]:checked');
+  if (picked) return picked.value;
+  const first = enabledProfiles()[0];
+  return first ? first.id : null;
+}
+
+function renderLinkTarget() {
+  const el = $('linkTarget');
+  if (!el) return;
+  const on = enabledProfiles();
+  el.innerHTML = '';
+  if (on.length < 2) { el.hidden = true; return; }
+  el.hidden = false;
+  const lead = document.createElement('span');
+  lead.className = 'sub2';
+  lead.textContent = 'Link into:';
+  el.append(lead);
+  on.forEach((p, i) => {
+    const wrap = document.createElement('label');
+    wrap.className = 'check';
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = 'linkTarget';
+    radio.value = p.id;
+    radio.checked = i === 0;
+    wrap.append(radio);
+    const text = document.createElement('span');
+    text.textContent = p.label;
+    wrap.append(text);
+    el.append(wrap);
+  });
+}
+
+// --------------------------------------------------------------- backups
+// Restoring makes a new profile, switched off, rather than overwriting
+// anything: the profile a backup came from may still be there.
+
+function applyBackups(r) {
+  if (r && r.backups) STATE.backups = r.backups;
+  renderBackups();
+}
+
+function backupWhen(iso) {
+  // The filename carries the timestamp too, but it is a filename. This
+  // reads the date the backup says it was taken, and falls back to the
+  // raw string rather than printing "Invalid Date".
+  const d = new Date(iso);
+  if (!iso || isNaN(d)) return iso || 'unknown';
+  return d.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+function backupWhat(b) {
+  const bits = [b.label];
+  bits.push(b.banks + (b.banks === 1 ? ' bank' : ' banks'));
+  if (b.kind === 'manual') bits.push('manual');
+  else if (b.kind === 'pre-migration') bits.push('before upgrade');
+  else bits.push(b.kind.replace(/^before-/, 'before '));
+  return bits.join(' · ');
+}
+
+function backupRow(b) {
+  const row = document.createElement('div');
+  row.className = 'bk';
+
+  const when = document.createElement('span');
+  when.className = 'when';
+  when.textContent = backupWhen(b.taken);
+  row.append(when);
+
+  const what = document.createElement('span');
+  what.className = 'what';
+  what.textContent = backupWhat(b);
+  row.append(what);
+
+  const acts = document.createElement('div');
+  acts.className = 'acts';
+
+  if (b.restorable) {
+    const restore = document.createElement('button');
+    restore.textContent = 'Restore';
+    restore.onclick = async () => {
+      let warn = 'Restore ' + b.label + '?\n\nAdds it back as a new ' +
+        'profile, switched off, with its ' + b.banks_restorable +
+        (b.banks_restorable === 1 ? ' bank' : ' banks') + '.';
+      if (b.environment !== 'sandbox') {
+        warn += ' Its banks keep their existing Plaid Items, so this costs nothing.';
+      }
+      if (!confirm(warn)) return;
+      loading(restore, 'Checking…');
+      try {
+        let r;
+        try {
+          r = await api('/api/backups/' + encodeURIComponent(b.name) + '/restore', {});
+        } catch (e) {
+          // A rotated secret is the usual reason, and the saved tokens are
+          // still good, so restoring and then fixing the secret is the
+          // way through rather than a dead end.
+          if (e.confirmable && confirm(e.message + '\n\nRestore it anyway?')) {
+            r = await api('/api/backups/' + encodeURIComponent(b.name) + '/restore',
+                          { force: true });
+          } else { throw e; }
+        }
+        applyProfiles(r);
+        say($('bkMsg'), 'Restored, switched off. Tick it to draw its accounts.', 'ok');
+      } catch (e) {
+        say($('bkMsg'), e.message, 'bad');
+      }
+      loaded(restore);
+    };
+    acts.append(restore);
+  } else {
+    const no = document.createElement('span');
+    no.className = 'sub2';
+    no.textContent = 'not restorable';
+    acts.append(no);
+  }
+
+  const del = document.createElement('button');
+  del.className = 'danger';
+  del.textContent = 'Delete';
+  del.onclick = async () => {
+    if (!confirm('Delete this backup of ' + b.label + '?\n\n' +
+                 'Its saved bank tokens go with it.')) return;
+    del.disabled = true;
+    try {
+      applyBackups(await api('/api/backups/' + encodeURIComponent(b.name) + '/delete', {}));
+      say($('bkMsg'), 'Backup deleted.', 'ok');
+    } catch (e) { say($('bkMsg'), e.message, 'bad'); del.disabled = false; }
+  };
+  acts.append(del);
+
+  row.append(acts);
+  return row;
+}
+
+function renderBackups() {
+  const list = $('backupList');
+  if (!list) return;
+  list.innerHTML = '';
+  const all = STATE.backups || [];
+  if (!all.length) {
+    const none = document.createElement('p');
+    none.className = 'hint2';
+    none.textContent = 'No backups yet.';
+    list.append(none);
+    return;
+  }
+  for (const b of all) list.append(backupRow(b));
+}
+
+$('backupNow').onclick = async () => {
+  const btn = $('backupNow');
   loading(btn, 'Saving…');
-  say($('advMsg'), 'Checking with Plaid…');
   try {
-    await api('/api/credentials', {
-      client_id: $('advClientId').value,
-      secret: $('advSecret').value,
-      environment: $('advEnv').value,
-      reset_items: true,
-    });
-    $('advClientId').value = '';
-    $('advSecret').value = '';
-    await loadState();
-    say($('advMsg'), 'Saved. Link your banks again above, then restart the widget.', 'ok');
+    const r = await api('/api/backups', {});
+    applyProfiles(r);
+    say($('bkMsg'), 'Backed up ' + r.saved +
+        (r.saved === 1 ? ' profile.' : ' profiles.'), 'ok');
   } catch (e) {
-    say($('advMsg'), e.message, 'bad');
+    say($('bkMsg'), e.message, 'bad');
   }
   loaded(btn);
 };
@@ -2773,7 +4276,9 @@ function sortableRow(section, acc, index, reason) {
   const who = document.createElement('span');
   who.className = 'who2';
   who.innerHTML = acc.institution_name +
-    (acc.mask ? ' <span class="num4">&bull;&bull;' + acc.mask + '</span>' : '');
+    (acc.mask ? ' <span class="num4">&bull;&bull;' + acc.mask + '</span>' : '') +
+    (acc.profile_label
+      ? ' <span class="plab">' + acc.profile_label + '</span>' : '');
 
   li.append(grip, who);
   if (reason) {
@@ -3266,7 +4771,11 @@ async function loadAppearance() {
 // the split button. Restarting is sequential rather than a second button
 // you remember to press: a restart before the save landed would read the
 // old file, which is exactly the mistake the old side-by-side pair invited.
-async function saveAppearance(restart) {
+//
+// reload adds a fresh pull from Plaid in between. It still saves first:
+// this menu hangs off the Save button, so an item here that quietly
+// discarded the edits sitting in the form would be a trap.
+async function saveAppearance(restart, reload) {
   const btn = $('saveAppearance'), chevron = $('saveMenuBtn');
   loading(btn, restart ? 'Saving…' : null);
   chevron.disabled = true;
@@ -3292,15 +4801,44 @@ async function saveAppearance(restart) {
     say($('appearanceMsg'), e.message, 'bad');
   }
 
-  if (!saved || !restart) { loaded(btn); chevron.disabled = false; return; }
+  if (!saved || (!restart && !reload)) { loaded(btn); chevron.disabled = false; return; }
+
+  // Before the restart, not after: the widget reads data.json as it comes
+  // up, so pulling first means it draws the new balances immediately
+  // instead of the old ones until the next scheduled fetch.
+  let reloadOk = null;
+  if (reload) {
+    loading(btn, 'Reloading…');
+    say($('appearanceMsg'), 'Saved. Fetching balances…');
+    try {
+      const r = await api('/api/verify', {});
+      reloadOk = true;
+      if (r.errors && r.errors.length) {
+        say($('appearanceMsg'),
+          'Saved. Fetched with ' + r.errors.length + ' error' +
+          (r.errors.length === 1 ? '' : 's') + ': ' + r.errors.join('; '), 'bad');
+      }
+    } catch (e) {
+      // Non-fatal: a failed pull leaves the previous data.json in place,
+      // and the restart below is still worth doing.
+      reloadOk = false;
+      say($('appearanceMsg'), 'Saved, but the reload failed: ' + e.message, 'bad');
+    }
+  }
+
+  if (!restart) { loaded(btn); chevron.disabled = false; loadState(); return; }
 
   loading(btn, 'Restarting…');
   say($('appearanceMsg'), 'Saved. Restarting…');
   try {
     const r = await api('/api/launch', {});
+    // Don't let the restart's success bury a reload that didn't work.
+    const did = reloadOk === false ? 'Saved (the reload failed)'
+              : reloadOk ? 'Saved and reloaded' : 'Saved';
     say($('appearanceMsg'), r.action === 'restarted'
-      ? 'Saved and restarted the widget.'
-      : 'Saved. Launched the widget – look for the icon in your system tray.', 'ok');
+      ? did + ', and restarted the widget.'
+      : did + '. Launched the widget – look for the icon in your system tray.',
+      reloadOk === false ? 'bad' : 'ok');
     setTimeout(() => { loaded(btn); chevron.disabled = false; loadState(); }, 4000);
     return;
   } catch (e) {
@@ -3310,8 +4848,9 @@ async function saveAppearance(restart) {
   chevron.disabled = false;
 }
 
-$('saveAppearance').onclick = () => saveAppearance(false);
-$('saveRestart').onclick = () => saveAppearance(true);
+$('saveAppearance').onclick = () => saveAppearance(false, false);
+$('saveRestart').onclick = () => saveAppearance(true, false);
+$('saveReloadRestart').onclick = () => saveAppearance(true, true);
 wireMenu('saveMenuBtn', 'saveMenu');
 
 // Loaded into the form rather than written straight to disk: one wrong

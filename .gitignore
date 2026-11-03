@@ -6,6 +6,25 @@ config/appearance.json
 config/data.json
 config/cache/
 
+# Profiles. secrets.json holds every profile's client_id and secret, and
+# backups/ holds those plus live access tokens -- a restorable backup is
+# the point, so these are the most sensitive files in the project and are
+# matched by name rather than left to the patterns above. The per-profile
+# data and layout files carry a profile id in the middle, so they need
+# globs; snapshots live under config/cache/ and are already covered.
+config/secrets.json
+config/backups/
+config/data.*.json
+config/layout.json
+config/layout.*.json
+config/layout.merged.json.before-prune
+config/layout.merged.json.before-restore
+
+# Re-included after those globs, because config/layout.*.json would
+# otherwise swallow a layout.example.json and the next person to add one
+# would never find out.
+!config/*.example.json
+
 # Runtime log. Written whenever there's no console to print to, which
 # includes a source run under pythonw -- and from source, DATA_DIR is
 # config/.
@@ -33,6 +52,7 @@ DesktopCards_Install.zip
 
 # An unused alternate mark.
 logo2.png
+changes.txt
 
 # Working notes, not documentation.
 Docs/exe_problems.md
@@ -40,3 +60,7 @@ Docs/exe_problems.md
 # Scratch UI reference snippets (Chakra samples pasted in while reworking
 # the setup page's controls) – source material, not part of the app.
 newUI/
+
+# Trail-code (formerly Graft) codebase map and learnings. Local-only tool,
+# never shared via git.
+.trail/

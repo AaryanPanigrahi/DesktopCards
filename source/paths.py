@@ -23,8 +23,10 @@ The four constants that matter:
                 is deleted when the process exits.
 
   DATA_DIR      writable, per-user, survives upgrades and the exe being
-                moved: config.json (Plaid secret + access tokens),
-                appearance.json, data.json, cache/.
+                moved: config.json (profiles + access tokens),
+                secrets.json (client ids and secrets), appearance.json,
+                data.json and data.<profile>.json, layout.<profile>.json,
+                backups/, cache/.
 
   EXAMPLES_DIR  where config.example.json and appearance.example.json are
                 read from. config/ from source, and the bundle frozen,
@@ -73,6 +75,24 @@ APPEARANCE_EXAMPLE_PATH = os.path.join(EXAMPLES_DIR, "appearance.example.json")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 APPEARANCE_PATH = os.path.join(DATA_DIR, "appearance.json")
 DATA_PATH = os.path.join(DATA_DIR, "data.json")
+
+# Credentials, split out of config.json so the config can be read, pasted
+# or attached to a bug report without leaking a Plaid secret. Keyed by
+# profile id; see profiles.py for the shape and for why the two files are
+# only ever joined in memory.
+SECRETS_PATH = os.path.join(DATA_DIR, "secrets.json")
+
+# Restore points. Holds secrets AND access tokens, because a backup that
+# cannot re-link a bank is not worth taking: nothing here ever calls
+# /item/remove, so an Item outlives its local record and a saved token
+# still works. Gitignored by name.
+BACKUPS_DIR = os.path.join(DATA_DIR, "backups")
+
+# The hand-sorted order across every enabled profile, keys namespaced
+# "<profile id>:Bank,last4". Separate from the per-profile layout files
+# because it is the one piece of layout that cannot belong to a single
+# profile -- see profile_layout_path().
+MERGED_LAYOUT_PATH = os.path.join(DATA_DIR, "layout.merged.json")
 CACHE_DIR = os.path.join(DATA_DIR, "cache")
 LOGOS_DIR = os.path.join(CACHE_DIR, "logos")
 CONFIG_SNAPSHOT_PATH = os.path.join(CACHE_DIR, "config_snapshot.json")
@@ -112,6 +132,37 @@ LOOPBACK = "127.0.0.1"
 # starting another, and importing setup_app for one integer would drag Flask
 # into the widget process to find it out.
 SETUP_PORT = 8009
+
+
+def profile_data_path(profile_id):
+    """That profile's own cached balances.
+
+    data.json stays the merged view every reader already opens; these are
+    what it is merged from, so disabling a profile and enabling it again
+    redraws its numbers immediately instead of waiting on a fetch."""
+    return os.path.join(DATA_DIR, f"data.{profile_id}.json")
+
+
+def profile_layout_path(profile_id):
+    """That profile's account order and hidden list.
+
+    One file per profile rather than a section in appearance.json: the
+    order key is "Bank,last4", which collides the moment the same bank is
+    linked in two profiles. Separate files make the collision impossible
+    instead of relying on namespacing, and deleting a profile is then
+    deleting a file rather than pruning keys out of a shared one.
+
+    Appearance itself stays global -- colours and fonts are how the widget
+    looks, not something a profile owns."""
+    return os.path.join(DATA_DIR, f"layout.{profile_id}.json")
+
+
+def profile_snapshot_path(profile_id):
+    """That profile's end-of-last-run config snapshot, used to spot a new
+    link or an edited logo_url. Under CACHE_DIR with the old single
+    snapshot, so it is covered by the same ignore rule and the same
+    "safe to delete" assumption."""
+    return os.path.join(CACHE_DIR, f"config_snapshot.{profile_id}.json")
 
 
 def logo_path():

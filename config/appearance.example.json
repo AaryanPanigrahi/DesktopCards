@@ -49,5 +49,36 @@
       "order": [],
       "hidden": []
     }
+  },
+  "colors": {
+    "_comment": "Every colour the widget draws, per theme. File-only: there is no field for this on the setup page. A token you leave out keeps the default shown here, and an unknown name is ignored. \"accent\" and \"shadow-color\" are null, meaning 'use the accent and shadow settings above'; give either a colour here and it wins over those, for this theme only.",
+    "light": {
+      "surface-0": "#f3f4f6",
+      "surface-1": "#ffffff",
+      "surface-2": "#e5e7eb",
+      "text-primary": "#1f2937",
+      "text-secondary": "#374151",
+      "text-muted": "#6b7280",
+      "text-faint": "#9ca3af",
+      "ring-track": "#e5e7eb",
+      "accent": null,
+      "error": "#ef4444",
+      "error-surface": "#fef2f2",
+      "shadow-color": null
+    },
+    "dark": {
+      "surface-0": "#1d2128",
+      "surface-1": "#292e37",
+      "surface-2": "#3e4651",
+      "text-primary": "#f2f4f7",
+      "text-secondary": "#d5dbe3",
+      "text-muted": "#a2abb8",
+      "text-faint": "#7a8391",
+      "ring-track": "#3e4651",
+      "accent": null,
+      "error": "#fa8585",
+      "error-surface": "#43282d",
+      "shadow-color": null
+    }
   }
 }

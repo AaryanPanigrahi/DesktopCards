@@ -55,6 +55,7 @@ hiddenimports = [
     "logo_cache",
     "paths",
     "net_guard",
+    "profiles",
     # pywebview resolves its backend by name at runtime, so the winforms
     # module and the pythonnet bridge it needs aren't reachable statically
     # either. This is the part most likely to need adjusting -- pywebview

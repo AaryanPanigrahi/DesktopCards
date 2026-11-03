@@ -33,6 +33,16 @@ You need your own free [Plaid](https://dashboard.plaid.com) developer
 account – this uses your credentials, not someone else's. Setup walks you
 through it.
 
+New accounts land on Plaid's free Trial plan, which includes the two
+products this reads (Balance and Liabilities) and allows 10 Production
+Items. An Item is one linked bank, and the allowance is for the lifetime of
+the Plaid team: `/item/remove` does not return a slot, so a bank linked,
+removed and linked again costs two of the ten. `items_created` in
+`config.json` tracks the running total – it only counts up, which is why
+it's a separate number from `len(items)` – and the Accounts tab shows it
+against the cap. Nothing enforces the cap locally, since a paid plan lifts
+it and there's no way to tell from a client ID which plan it's on.
+
 **From a packaged build** (what you'd hand to someone else):
 
 1. Run `DesktopCards-Setup.exe`. It opens a page in your browser.
@@ -69,7 +79,8 @@ that away:
 |---|---|---|
 | **Code and the page** (read-only) | `source/` | inside the exe, unpacked to a temp dir per launch |
 | **The examples** (`config.example.json`, `appearance.example.json`) | `config/` | bundled in the exe |
-| **Your data** (`config.json`, `appearance.json`, `data.json`, `cache/`, `desktopcards.log`) | `config/` | `%LOCALAPPDATA%\DesktopCards\` |
+| **`secrets.example.json`** (a template only; nothing seeds from it) | `config/` | not shipped |
+| **Your data** (`config.json`, `secrets.json`, `appearance.json`, `data.json`, the per-profile `data.<id>.json` / `layout.<id>.json`, `layout.merged.json`, `backups/`, `cache/`, `desktopcards.log`) | `config/` | `%LOCALAPPDATA%\DesktopCards\` |
 | **Docs** | `Docs/` | not shipped |
 | **`logo.png`, `dist/`, the generated `.ico`** | repo root | n/a |
 
@@ -99,6 +110,13 @@ actually reads (see Settings without editing JSON).
 
 ## Uninstalling
 
+Clearing **Keep my settings and linked accounts** brings up a second prompt
+offering a backup, ticked. Left ticked, `backups/` survives with a restorable
+copy of every profile's credentials and bank tokens; cleared, the folder goes
+with everything else. `secrets.json` is in the keep list alongside
+`config.json` for the obvious reason: keeping one without the other would
+leave a config naming banks that nothing can read.
+
 `Uninstall.exe`, written into `%LOCALAPPDATA%\DesktopCards\` beside the app
 by the install step, and listed in **Settings → Apps** so the Uninstall button
 there works. From a checkout there is no installed file to run, so it's
@@ -110,7 +128,7 @@ and linked accounts** is ticked by default:
 
 | | Ticked (default) | Cleared |
 |---|---|---|
-| `config.json` (Plaid keys, one access token per bank) | kept | deleted |
+| `config.json`, `secrets.json` (the Plaid keys, one access token per bank) | kept | deleted |
 | `appearance.json`, a replaced `logo.png` | kept | deleted |
 | `data.json`, `cache/`, `desktopcards.log` | deleted | deleted |
 | `%LOCALAPPDATA%\DesktopCards\` itself | stays, holding what was kept | removed |
@@ -128,14 +146,18 @@ Then, in this order, because the order is the only thing that makes it work:
    lock and lets its writes finish; a kill leaves that lock behind to block
    the next install. Any setup server gets `POST /api/quit`. `taskkill` is the
    backstop, used only if something is still answering afterwards.
-2. **Shortcuts go** – the Start-menu entry and the Startup one. Both are just
+2. **The backup is written**, if one was asked for – after the widget is
+   stopped, not before. It fetches on a timer and writes `config.json` back
+   when it does, so a backup taken while it was still running could be a
+   snapshot of a file that changed a second later.
+3. **Shortcuts go** – the Start-menu entry and the Startup one. Both are just
    files, which is why `install_autostart` uses the Startup folder rather than
    a `Run` registry key.
-3. **The Add/Remove entry goes**, from `HKCU`. Nothing here needs
+4. **The Add/Remove entry goes**, from `HKCU`. Nothing here needs
    administrator: shortcuts live in `%APPDATA%`, the app and its data in
    `%LOCALAPPDATA%`, and the uninstall entry in the per-user hive.
-4. **Data goes**, minus whatever the checkbox saved.
-5. **The two exes go last, from outside the process.** Windows holds an
+5. **Data goes**, minus whatever the checkbox saved.
+6. **The two exes go last, from outside the process.** Windows holds an
    executing image open, so the uninstaller can't delete the uninstaller. A
    detached `cmd` waits for this process to exit, then deletes both and
    `rmdir`s the folder – without `/s`, so a folder still holding kept
@@ -157,7 +179,7 @@ root. Paths below are given bare for readability.
 |---|---|
 | `plaid_link_setup.py` | One-time (per bank) setup – opens Plaid's real Link widget in a browser so you log into your bank directly; saves the resulting access token. |
 | `fetch_data.py` | Pulls balances + credit card details from Plaid for every linked account, writes `data.json`. The only script that talks to Plaid. Runs on an interval timer inside the widget, not continuously. |
-| `serve.py` | Minimal local web server so the dashboard page can read its JSON files. Serves only an explicit allowlist of files – `config.json` (which holds the Plaid secret and access tokens) is never reachable over HTTP. Loopback-bound and behind `net_guard`. Also expands `appearance.json` into what the page needs on every request. Normally hosted as a thread inside `widget.py`; still runnable on its own for debugging the page, where `POST /restart` and `POST /quit` correctly report that there is no widget here to act on. |
+| `serve.py` | Minimal local web server so the dashboard page can read its JSON files. Serves only an explicit allowlist of files – three names and `cache/`, so `config.json` and `secrets.json` (the Plaid keys), the per-profile caches and `backups/` are all unreachable over HTTP by construction rather than by being listed as forbidden. Note that `data.json` is served and `data.<id>.json` is not: the pattern is an exact name, not a glob. Loopback-bound and behind `net_guard`. Also expands `appearance.json` into what the page needs on every request. Normally hosted as a thread inside `widget.py`; still runnable on its own for debugging the page, where `POST /restart` and `POST /quit` correctly report that there is no widget here to act on. |
 | `widget.py` | Launches the pinned window itself: hosts the server, opens a frameless WebView2 window at the configured position/size, hides it from the taskbar, pins it behind the desktop icons so it survives Win+D, clips it to rounded corners, runs the interval fetch, and runs the system tray icon (Reload / Modify / Restart / Quit). |
 | `dashboard.html` / `dashboard.js` | The widget's UI and all its behavior (rendering, auto-refresh, auto-resize). |
 | `paths.py` | Where every file lives. Splits read-only bundled assets from writable per-user data, which a packaged build requires and a source checkout collapses back into one folder. |
@@ -171,21 +193,77 @@ root. Paths below are given bare for readability.
 | `build.py` / `DesktopCards.spec` / `make_icon.py` | Produce `dist/DesktopCards.exe` – see Building the executable. |
 | `logo.png` | The single source of truth for the app's mark – exe icon, Start-menu shortcut, and tray icon all derive from it. At the repo root rather than in `source/`, because it's the project's own identity rather than part of the dashboard. |
 | `mac_port.md` | What a macOS port would actually involve. Planning notes, not a commitment. |
-| `appearance.json` | Appearance, window placement, and layout/ordering settings, all in one file (see below). **Gitignored** – it holds your personal monitor position, same reasoning as `config.json`. |
+| `appearance.json` | Appearance, window placement, and the section settings – titles and the row rules (see below). The card order and the hidden list moved out to `layout.merged.json` when profiles arrived; everything else about how the widget looks is still here. **Gitignored** – it holds your personal monitor position, same reasoning as `config.json`. |
 | `appearance.example.json` | A placeholder-position template of `appearance.json`, for the same sharing reason as `config.example.json`. |
 | `cache/logos/` | Cached institution logos (one PNG per bank). Gitignored, like `config.json`. |
-| `cache/config_snapshot.json`, `cache/appearance_snapshot.json` | `config.json`/`appearance.json` as of the end of the last run – how `fetch_data.py`/`widget.py` tell exactly what changed (see How a refresh actually happens). Gitignored. |
+| `cache/config_snapshot.<id>.json`, `cache/appearance_snapshot.json` | One profile's items, and `appearance.json`, as of the end of the last run – how `fetch_data.py`/`widget.py` tell exactly what changed (see How a refresh actually happens). One snapshot per profile, or a first run after enabling a profile would make every bank in every other profile look new and re-fetch all their logos. The client ID and secret are stripped before writing: the snapshot only needs the items, and `cache/` is not a place to keep a second copy of your credentials. Gitignored. |
 | `config.json` | Your Plaid credentials, access tokens, and the settings below. **Gitignored** – never committed. |
 | `config.example.json` | A credential-free template of `config.json`, meant for sharing this tool with someone else: they copy it to `config.json` and fill in their own values rather than yours. |
+| `profiles.py` | The profile model and every file that belongs to one: `config.json`'s `profiles` block, `secrets.json`, the per-profile data/layout/snapshot files, the merged layout, and backups. Also the migration from the old flat single-credential config. Everything else goes through `resolve()`, which hands back one profile shaped exactly like that old flat config, which is why the fetch path needed no rewriting. |
+| `secrets.json` | Every profile's `client_id` and `secret`, keyed by profile id, and nothing else. **Gitignored.** Split out of `config.json` so the rest of your settings can be read or pasted into an issue without your Plaid keys going with them. |
+| `secrets.example.json` | A placeholder template of `secrets.json`. |
+| `data.<id>.json` | One profile's last good balances, per bank. A bank this run could not reach is served from here instead, marked stale, so one expired login does not make its cards disappear while the banks either side of it refresh normally (see Configuration). Also what a disabled-then-enabled profile redraws from. Gitignored. |
+| `layout.<id>.json` | Where one profile's order and hidden list used to live. Read once, namespaced into `layout.merged.json`, and never written again – kept so an install that has not saved since the order went global still finds its layout. Gitignored. |
+| `layout.merged.json` | The card order and hidden list, for every profile, with keys always namespaced by profile id – one profile drawing or five. Gitignored. |
+| `backups/` | Restore points, one JSON file per profile per backup. Holds credentials **and** live access tokens by design, which is what lets a restore recover a bank for free. The most sensitive folder in the project; gitignored by name. |
 
 ## Configuration (`config.json`)
 
 | Key | Meaning |
 |---|---|
-| `client_id`, `secret`, `environment` | Your Plaid API credentials and environment (`sandbox` or `production`). |
-| `items` | The linked banks' access tokens, populated automatically by `plaid_link_setup.py`. Each one also carries `use_custom_logo`/`logo_url` – see Logos below. |
+| `profiles` | One entry per Plaid client ID + environment pair, keyed by an opaque 12-hex id. See below. |
+| `retired_profile_ids` | Ids of deleted profiles. Never reused, so a stale `data.<id>.json` or a key in `layout.merged.json` can never be read as belonging to a new profile. |
 | `port` | Local port `serve.py` runs on. |
 | `fetch_interval_minutes` | How often to re-pull from Plaid. Read at launch by the widget's own timer, so a change applies on the next Restart – there's no schedule registered with Windows to re-apply. |
+
+Each profile holds:
+
+| Key | Meaning |
+|---|---|
+| `environment` | `production` or `sandbox`. |
+| `nickname` | What the UI calls it. Falls back to `environment ·last4` of the client ID. |
+| `enabled` | Whether the widget draws it. Several production profiles can be on at once; a sandbox profile runs alone, and enabling one switches the others off. |
+| `items` | That profile's linked banks and their access tokens, populated by `plaid_link_setup.py`. Each one also carries `use_custom_logo`/`logo_url` – see Logos below. |
+| `items_created` | How many Plaid Items this profile has ever created, including banks since unlinked. What the Accounts tab counts against the Trial cap, summed over every production profile sharing a client ID. Plaid has no API for this number, so it is a local tally and nothing can verify it; it is hand-editable for exactly that reason. Falls back to `len(items)` when absent, which under-reports rather than over-reports. |
+
+The credentials themselves are in `secrets.json`, under the same ids:
+
+```json
+{ "a1b2c3d4e5f6": { "client_id": "...", "secret": "..." } }
+```
+
+Two files rather than one so the settings can be shared and the keys can't.
+`profiles.resolve(id)` joins them back together in memory, and that is the
+only shape the rest of the code sees.
+
+### Migrating from the old shape
+
+An install written before profiles existed has `client_id`, `secret`,
+`environment`, `items` and `items_created` flat at the top of `config.json`.
+The first run after upgrading moves them into one enabled profile, silently:
+there is no sensible alternative to migrating, and a `pre-migration` backup is
+written first and never pruned, so the whole old file is recoverable. The
+secret is written to `secrets.json` before `config.json` is rewritten, so a
+crash between the two leaves the old config intact and the migration simply
+runs again. `appearance.json`'s `layout` block moves to `layout.merged.json` at
+the same time, its keys gaining the profile prefix (and to
+`layout.<id>.json` as well, so an older build run against the same
+install still finds one), and `data.json` is copied to `data.<id>.json` so the first
+fetch afterwards doesn't treat every existing bank as new.
+
+### Backups
+
+`backups/` holds one JSON file per profile per backup, named by timestamp.
+One is taken automatically before unlink, reset and delete, on request from
+the Backups section, and at uninstall if you ask for it. Restoring recreates
+the profile under a **fresh** id, switched off, with its banks: nothing here
+ever calls Plaid's `/item/remove`, so an Item outlives its local record and a
+saved access token still works. That is the whole point – a restore recovers a
+bank without spending another Item.
+
+The last five automatic backups are kept. Manual and `pre-migration` ones are
+never pruned: someone asked for those, or they are the only way back from a
+one-way change.
 
 ## Appearance, window, and layout (`appearance.json`)
 
@@ -213,9 +291,10 @@ personal to your own screen setup, so it's gitignored the same way (see
 | `opacity` | How opaque the widget is, `0`–`1`, when `translucent_background` is on. Not applied uniformly – the page backdrop takes this value in full and the cards, bars and text give up progressively less of theirs, so text stays readable. `1` switches the whole effect off (see Translucency), and anything below `0.15` is clamped to it. |
 | `window.x` / `.y` | Top-left corner of the widget, in screen pixels – pick a spot on whichever monitor you want it on. |
 | `window.survive_show_desktop` | Keeps the widget visible through Win+D ("show desktop"). |
-| `layout.depository.title` / `layout.credit.title` | The section header shown above each group of cards. |
-| `layout.depository.order` / `layout.credit.order` | Which cards appear (and in what order) within that section – a list of `"Bank Name,last4"` strings (e.g. `"Chase,0000"`), matched against what's actually on the dashboard. Accounts not listed just get appended at the end. Maintained for you by the Layout tab. |
-| `layout.depository.hidden` / `layout.credit.hidden` | Cards to leave off the widget entirely, same key format. The account stays linked and keeps its place in `order`; it just isn't drawn. Set by the tickboxes in the Modify page's Accounts tab. |
+| `colors.light` / `colors.dark` | Every color the widget paints, overridable one token at a time, per theme. No form field for this one either – the file is the whole interface. See The palette below. |
+| `layout.depository.title` / `layout.credit.title` | The section header shown above each group of cards. This one really is in `appearance.json`: a title describes the section, not the profile, so it stayed behind when the order left. |
+| `layout.depository.order` / `layout.credit.order` | **In `layout.merged.json`, not here.** Which cards appear (and in what order) within that section – a list of `"<profile id>:Bank Name,last4"` strings, matched against what's actually on the dashboard. Accounts not listed just get appended at the end. Maintained for you by the Layout tab. |
+| `layout.depository.hidden` / `layout.credit.hidden` | **In `layout.merged.json`, not here.** Cards to leave off the widget entirely, same key format. The account stays linked and keeps its place in `order`; it just isn't drawn. Set by the tickboxes in the Modify page's Accounts tab. |
 | `layout.depository.new_row_digit_threshold` | How many digits a checking/savings balance needs before that card drops onto a row of its own instead of sitting two-up (default `6`, i.e. $100,000+). See Oversized balances below. |
 | `layout.depository.new_row_name_length_threshold` | How many characters an institution name can have before that card drops onto a row of its own instead of sitting two-up (default `12`). See Oversized balances below. |
 
@@ -356,11 +435,77 @@ distances as inline custom properties on `<html>`, next to the accent it
 already sends, and a non-hex colour or an unparseable distance falls back to
 the stylesheet's own rather than reaching the attribute.
 
+## The palette
+
+`appearance.json`'s `colors` block overrides any color the widget draws,
+one token at a time, under `"light"` and `"dark"`:
+
+```json
+"colors": {
+  "dark": { "surface-1": "#1b2b1f", "text-primary": "#eafbe7" }
+}
+```
+
+Anything you leave out keeps its default, and an unrecognised token name is
+dropped by `serve.resolve_colors` rather than reaching the page, where it
+would become a live custom property nothing reads. The defaults are in
+`serve.DEFAULT_COLORS`, spelled out in full in `appearance.example.json`,
+and repeated in `dashboard.html` – the stylesheet has to carry them so the
+widget paints correctly in the moment before `/appearance.json` arrives.
+Change a default and all three move together.
+
+| Token | Light | Dark | Where you see it |
+|---|---|---|---|
+| `surface-0` | `#f3f4f6` | `#1d2128` | The page behind the cards |
+| `surface-1` | `#ffffff` | `#292e37` | A card face |
+| `surface-2` | `#e5e7eb` | `#3e4651` | Dividers |
+| `text-primary` | `#1f2937` | `#f2f4f7` | Balances, bank names |
+| `text-secondary` | `#374151` | `#d5dbe3` | Secondary body text |
+| `text-muted` | `#6b7280` | `#a2abb8` | The masked digits, `/ $2,500` |
+| `text-faint` | `#9ca3af` | `#7a8391` | Section headings, the clock |
+| `ring-track` | `#e5e7eb` | `#3e4651` | The unfilled part of a progress bar |
+| `error` | `#ef4444` | `#fa8585` | The warning state |
+| `error-surface` | `#fef2f2` | `#43282d` | That warning's background |
+| `accent` | `null` | `null` | The bar fill and the card numbers |
+| `shadow-color` | `null` | `null` | The cards' hard offset shadow |
+
+The last two are `null` on purpose, meaning *leave it alone*. Both already
+have an owner – `accent` at the top of the file, filled in from your
+Windows accent color, and `shadow.color` in the shadow block – and a
+default here would quietly outrank them. Put a color in and it wins, for
+that theme only.
+
+**Why there's no editor for this.** A palette editor is a lot of UI for
+something most people never touch, and the setup page would then have to
+round-trip twelve colors it has no opinion about. So the page is never told
+the block exists: it isn't rendered, and on save `colors` is read back from
+disk rather than from the posted object – the same guard `shadow_ui` and
+`layout` already use, and for the same reason. A hand-edit made while the
+Appearance tab sat open can't be clobbered by a stale copy being written
+over it.
+
+**What it writes.** Each override lands on the *raw* tier of its token –
+`--surface-1-raw`, not `--surface-1` – which is the same tier `accent` uses.
+That keeps a custom color going through the translucency layer instead of
+sitting opaque on top of it. Only the theme in use is written: setting both
+would leave the losing theme's values in the element's inline style, where
+the stylesheet's own `[data-theme]` rules, being less specific, could never
+win them back on a theme switch.
+
+**One interaction worth knowing.** Setting `surface-1` also beats the
+dark-plus-shadow-off rule that darkens a card face a step (see Card
+shadow). That's the right way round – an explicit color should win over an
+automatic adjustment – but it does mean the two shadow states stop matching
+in brightness, which is what that rule existed to fix.
+
+---
+
 ## Dark theme
 
-`"dark_theme": true` and the whole widget swaps palette. It's one flag, not a
-set of colors, because every color the stylesheet paints already came from a
-`--surface-*` / `--text-*` variable – so the theme is a single
+`"dark_theme": true` and the whole widget swaps palette. It's one flag
+rather than a set of colors (the `colors` block below is how you change the
+colors themselves), because every color the stylesheet paints already came
+from a `--surface-*` / `--text-*` variable – so the theme is a single
 `:root[data-theme="dark"]` block in `dashboard.html` that redefines those
 variables, and no rule below it needs a dark variant. `dashboard.js` only
 sets the attribute.
@@ -751,6 +896,13 @@ showing stale numbers.
 A failed fetch (no network, a Plaid rate limit, an item needing re-auth) is
 logged and skipped, never fatal – the loop has to survive to try again.
 
+Failure is per bank. A bank that could not be reached keeps the balances from
+its last good fetch, drawn dimmed, and says why in **Needs Attention**
+underneath; the banks either side of it refresh normally. That covers a whole
+profile failing too – a refused secret errors every one of its items – without
+making it a different kind of event. The alternative was those cards vanishing,
+which looks exactly like the bank having been unlinked.
+
 ### Restart and the port
 
 The tray's **Restart** is a full process relaunch, for the settings that are
@@ -1104,9 +1256,12 @@ something stale.
 Drops save immediately, matching the tickboxes, with **Undo last move** for
 the one that went wrong. Two guards sit behind that:
 
-- A posted order must be a permutation of what's on file. Anything else is a
-  stale page naming accounts that have since gone, and it's refused with a
-  409 rather than written.
+- A posted order must be a permutation of the accounts the page was shown –
+  the ones belonging to profiles that are currently drawing. Anything else
+  is a stale page naming accounts that have since gone, and it's refused
+  with a 409 rather than written. Not a permutation of the whole stored
+  order: that order also holds the entries of every switched-off profile,
+  which the page has never seen and cannot post back.
 - The Appearance tab holds a whole copy of `appearance.json`, so saving it
   could carry a stale `layout` back over a reorder. Two things prevent it: a
   layout change drops that cached copy so the tab re-reads, and the appearance
@@ -1143,13 +1298,31 @@ matched nothing on a real dashboard, so anyone opening the file to reorder
 their cards found a list naming none of their banks and no way to learn the
 correct strings. Opening the management view now rewrites those lists with the
 real `"Bank Name,last4"` keys, read out of `data.json` and written back to
-`appearance.json`, and the Appearance tab prints them under **Card order**.
+`layout.merged.json`, and the Appearance tab prints them under **Card
+order**.
 
 Keys already in the list keep their position, so a hand-sorted order survives;
 new accounts are appended and departed ones dropped. `order_key` in
 `setup_app.py` has to match `orderKey` in `dashboard.js` exactly, or a
 hand-written order silently matches nothing and every card falls through to
-the appended tail. `balance_digits` has to agree with `intDigits` for the same
+the appended tail.
+
+Every key carries a `<profile id>:` prefix and the whole order lives in one
+file, `layout.merged.json` – with one profile enabled as much as with five.
+The prefix is needed because the same bank linked in two profiles produces
+the same `"Bank,last4"`, and one key would otherwise move or hide two cards.
+Doing it unconditionally is what keeps the keys from changing shape when a
+profile is switched on or off: they used to, and a hand-sorted order was
+silently discarded the first time a second profile was enabled. The widget
+tries the namespaced key first and the plain one second, so a hand-edited
+file still matches.
+
+Switching a profile off hides its cards and leaves its entries exactly where
+they are in the order, so switching it back on puts them back where they
+were. A card dragged across one of those invisible entries leaves it at the
+bottom of the move – it travels with the visible key in front of it, which
+is the only rule that doesn't need the page to know about cards it was never
+shown. `balance_digits` has to agree with `intDigits` for the same
 reason: it's what the Layout tab's row badges are computed from, and the
 widget is the thing that actually does the breaking.
 

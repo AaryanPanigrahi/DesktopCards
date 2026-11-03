@@ -268,7 +268,7 @@
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
     overflow: hidden;
     border-radius: var(--corner-radius);
-    width: auto; height: auto; max-height: 700px;
+    width: auto; height: auto;
   }
 
   /* #shell itself stays width:auto -- zoom rescales what's *inside* an
@@ -292,7 +292,6 @@
        leaving dead space in a full-size window. Grows by --extra-width
        when an oversized debit balance needs more room. */
     width: calc(var(--content-width) + 24px + var(--extra-width) + var(--shadow-grow));
-    max-height: 700px;
     /* The shadow is cast down and to the right only, so only those two
        sides need extra room -- and only as much as the shadow actually
        occupies, which is the offset. The other half of --shadow-grow (the
@@ -342,6 +341,13 @@
     /* Inert at the 0 defaults -- see --shadow-offset above. */
     border: var(--shadow-border) solid var(--shadow-color);
     box-shadow: var(--shadow-offset) var(--shadow-offset) var(--shadow-color);
+  }
+
+  /* A bank fetch_data could not reach this run, still showing its last
+     good balances. Dimmed rather than labelled: the Needs Attention
+     section below already names the bank and the reason. */
+  .card.stale {
+    opacity: 0.72;
   }
 
   .card-head {
@@ -431,6 +437,27 @@
   }
 
   .card-grid .bank-name { font-size: 15px; }
+
+  /* Bank name and profile label stacked, so the label indents from the
+     name rather than from the logo. Takes .bank-name's old left margin and
+     its shrink-to-fit sizing, so the card-mask and due date beside it keep
+     claiming the row's leftover space exactly as before. */
+  .head-info {
+    margin-left: 0.5rem; min-width: 0;
+    display: flex; flex-direction: column; justify-content: center;
+  }
+
+  .head-info .bank-name { margin-left: 0; }
+
+  /* Deliberately quiet: which profile a card came from is context, not
+     information you read the card for. Only drawn when more than one
+     profile is enabled. */
+  .profile-tag {
+    color: var(--text-muted); font-size: 11px; line-height: 1.2;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  .card-grid .profile-tag { font-size: 10px; }
 
   .card-mask {
     margin-left: 0.5rem; color: var(--accent); font-weight: 600;

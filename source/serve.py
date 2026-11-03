@@ -4,7 +4,7 @@ dashboard.html's fetch('data.json') works without CORS issues. Idle except
 when a request actually comes in -- no polling, no background work.
 
 Also expands appearance.json's /appearance.json response (accent + scale +
-spacing + layout) on every request. appearance.json holds both appearance
+spacing + layout + the palette) on every request. appearance.json holds both appearance
 settings and the section layout/ordering (previously a separate
 layout.json) -- one file, one fetch. Its custom_spacing flag picks which
 spacing source wins: false uses extra_spacing (one number, applied to all
@@ -43,6 +43,7 @@ import time
 
 import fetch_data
 import net_guard
+import profiles
 
 from paths import APPEARANCE_PATH, ASSET_DIR, CONFIG_PATH, DATA_DIR, LOOPBACK
 
@@ -96,6 +97,90 @@ def resolve_spacing(appearance):
     return {"left": v, "top": v, "right": v, "bottom": v}
 
 
+# The widget's palette, as dashboard.html declares the raw tokens, minus
+# the "--" and the "-raw". appearance.json's "colors" block overrides any
+# of these, per theme; anything it leaves out keeps the value here. These
+# ARE the defaults -- the stylesheet carries the same numbers so the page
+# renders correctly in the moment before /appearance.json arrives, and the
+# two have to be kept in step.
+#
+# Deliberately not on the setup page. A palette editor is a lot of UI for
+# something most people never touch, and the page would then have to
+# round-trip twelve colours it has no opinion about. The file is the whole
+# interface.
+DEFAULT_COLORS = {
+    "light": {
+        "surface-0": "#f3f4f6",       # the page behind the cards
+        "surface-1": "#ffffff",       # a card face
+        "surface-2": "#e5e7eb",       # dividers
+        "text-primary": "#1f2937",    # balances, bank names
+        "text-secondary": "#374151",
+        "text-muted": "#6b7280",      # the masked digits, "/ $2,500"
+        "text-faint": "#9ca3af",      # section headings, the clock
+        "ring-track": "#e5e7eb",      # the unfilled part of a progress bar
+        # None means "leave it alone": the top-level "accent" setting (your
+        # Windows colour) and the "shadow" block already own these two, and
+        # a default here would quietly outrank both. Put a colour in the
+        # file and it wins, for that theme only.
+        "accent": None,
+        "error": "#ef4444",
+        "error-surface": "#fef2f2",
+        "shadow-color": None,         # the cards' hard offset shadow
+    },
+    "dark": {
+        "surface-0": "#1d2128",
+        "surface-1": "#292e37",
+        "surface-2": "#3e4651",
+        "text-primary": "#f2f4f7",
+        "text-secondary": "#d5dbe3",
+        "text-muted": "#a2abb8",
+        "text-faint": "#7a8391",
+        "ring-track": "#3e4651",
+        "accent": None,
+        "error": "#fa8585",
+        "error-surface": "#43282d",
+        "shadow-color": None,
+    },
+}
+
+
+def resolve_colors(appearance):
+    """Both themes, every token, overrides applied.
+
+    Always the full palette rather than only what was customised, so the
+    page can write the lot without checking. A token name that is not one
+    of ours is dropped here rather than reaching the page, where it would
+    become a live custom property nothing reads."""
+    saved = appearance.get("colors") or {}
+    out = {}
+    for theme, defaults in DEFAULT_COLORS.items():
+        merged = dict(defaults)
+        override = saved.get(theme)
+        if isinstance(override, dict):
+            merged.update({k: v for k, v in override.items()
+                           if k in defaults and isinstance(v, str) and v})
+        # None survives only where nobody set a colour -- accent and
+        # shadow-color, which have owners of their own. Dropping them here
+        # rather than sending null keeps the page's "did they set this?"
+        # test to one shape.
+        out[theme] = {k: v for k, v in merged.items() if v}
+    return out
+
+
+def layout_for_widget(appearance):
+    """What the widget draws sections with.
+
+    The order lives in the profile layout; the titles and row thresholds
+    are still appearance.json's, so the two are merged rather than one
+    replacing the other. appearance.json alone is the answer only before
+    anything has been saved."""
+    saved = profiles.widget_layout()
+    base = appearance.get("layout", {})
+    if saved is None:
+        return base
+    return profiles.layout_with_settings(base, saved)
+
+
 def build_appearance():
     with open(APPEARANCE_PATH, "r") as f:
         appearance = json.load(f)
@@ -125,7 +210,18 @@ def build_appearance():
         "translucent_background": appearance.get("translucent_background", False),
         "opacity": appearance.get("opacity", 1.0),
         "fetch_interval_minutes": config.get("fetch_interval_minutes"),
-        "layout": appearance.get("layout", {}),
+        # From the profile files, not appearance.json: the layout moved
+        # out when profiles arrived, because which accounts exist and what
+        # order they are in is per profile. appearance.json is the
+        # fallback for an install that has not migrated yet.
+        # None, not {}, when nothing has been saved: a layout saved
+        # with everything hidden is a real answer, and falling back to
+        # appearance.json for it un-hid every card.
+        "layout": layout_for_widget(appearance),
+        # The palette. Unlike dark_theme above, this IS per-colour: the
+        # stylesheet's own [data-theme] block is the default, and this is
+        # whatever the file says instead of it.
+        "colors": resolve_colors(appearance),
     }).encode("utf-8")
 
 
@@ -220,8 +316,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         try:
             fetch_data.main()
         except (Exception, SystemExit) as e:
-            # SystemExit too -- fetch_data.load_config() exits the process
-            # outright if config.json is missing, which would otherwise
+            # SystemExit too -- fetch_data exits the process outright
+            # when no profile is enabled to fetch for, which would otherwise
             # silently kill just this request thread and leave the client
             # hanging instead of getting a response.
             ok = False

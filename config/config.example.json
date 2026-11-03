@@ -1,8 +1,15 @@
 {
-  "client_id": "YOUR_PLAID_CLIENT_ID",
-  "secret": "YOUR_PLAID_SECRET",
-  "environment": "production",
+  "_comment": "A credential-free template of config.json. Credentials live in secrets.json, keyed by the same profile ids used here; see secrets.example.json.",
   "port": 5000,
   "fetch_interval_minutes": 90,
-  "items": []
+  "profiles": {
+    "PROFILE_ID": {
+      "environment": "production",
+      "nickname": "",
+      "enabled": true,
+      "items": [],
+      "items_created": 0
+    }
+  },
+  "retired_profile_ids": []
 }

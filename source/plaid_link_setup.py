@@ -29,7 +29,8 @@ from plaid.model.item_public_token_exchange_request import (
 from plaid.model.institutions_get_by_id_request import InstitutionsGetByIdRequest
 
 import net_guard
-from paths import CONFIG_PATH, LOOPBACK
+import profiles
+from paths import LOOPBACK
 
 LINK_PORT = 8008
 
@@ -39,20 +40,30 @@ ENV_MAP = {
 }
 
 
-def load_config():
-    if not os.path.exists(CONFIG_PATH):
+def load_config(profile_id=None):
+    """The profile a link will attach the new bank to.
+
+    Shaped like the flat config.json this used to read, so build_client()
+    and the link handler are unchanged. With several profiles enabled,
+    active() is a choice rather than a lookup, so the link flow pins the
+    id it picked and passes it back here for the exchange -- resolving it
+    twice could mint the token against one profile and exchange it
+    against another."""
+    profiles.ensure_migrated()
+    active = profiles.resolve(profile_id) if profile_id else profiles.active()
+    if active is None:
         sys.exit(
-            "config.json not found. Run setup first, or copy "
+            "No Plaid profile configured. Run setup first, or copy "
             "config.example.json to config.json and fill in your Plaid "
             "client_id/secret/environment."
         )
-    with open(CONFIG_PATH, "r") as f:
-        return json.load(f)
+    return active
 
 
 def save_config(config):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f, indent=2)
+    """Persist a newly linked item against its profile. Credentials are
+    never written from here -- see profiles.save_resolved()."""
+    profiles.save_resolved(config)
 
 
 def build_client(config):
@@ -73,18 +84,45 @@ def build_client(config):
     return plaid_api.PlaidApi(plaid.ApiClient(plaid_config))
 
 
-def new_link_token(client):
+# Plaid's "OAuth Multi-item" Sandbox profile -- the busiest of the eight
+# starter profiles, so a sandbox link exercises the OAuth hand-off and an
+# institution carrying several accounts rather than the one-bank happy
+# path. Prefilled only in sandbox: in production this field would be a
+# real user's phone number, and a fake one there changes what Link shows.
+# The matching one-time code for every sandbox profile is 123456.
+SANDBOX_PROFILE_PHONE = "+14155550138"
+
+
+def new_link_token(client, environment=None):
     """A short-lived token authorising one run of the Link widget.
 
     Also the cheapest call that proves a client_id/secret pair actually
     works, which is how setup validates credentials before saving them."""
+    # liabilities, not auth. Auth was wrong twice over: this app never reads
+    # account or routing numbers, and asking for them makes Link show only
+    # "checking, savings, and cash management accounts", which is why credit
+    # cards could not be linked at all. Balance needs no entry here -- the
+    # API rejects it as a product and initializes it alongside whatever else
+    # is asked for -- so liabilities alone covers both calls fetch_data makes.
+    #
+    # The cost is that Link hides institutions with no liabilities support,
+    # so a depository-only account at one of those cannot be linked. Judged
+    # the better trade than requesting transactions, whose data this never
+    # touches, purely to widen the institution list.
+    #
+    # This only affects Items created from here on: liabilities cannot be
+    # added to an existing Item by changing this, and one linked without it
+    # answers /liabilities/get with PRODUCTS_NOT_SUPPORTED until re-linked.
+    user = LinkTokenCreateRequestUser(client_user_id="local-user")
+    if environment == "sandbox":
+        user.phone_number = SANDBOX_PROFILE_PHONE
+
     req = LinkTokenCreateRequest(
-        products=[Products("auth")],
-        required_if_supported_products=[Products("liabilities")],
+        products=[Products("liabilities")],
         client_name="Personal Balance Dashboard",
         country_codes=[CountryCode("US")],
         language="en",
-        user=LinkTokenCreateRequestUser(client_user_id="local-user"),
+        user=user,
     )
     return client.link_token_create(req)["link_token"]
 
@@ -107,7 +145,26 @@ def add_item(client, config, public_token, institution_name, institution_id):
         "use_custom_logo": False,
         "logo_url": None,
     }
+    # Read before the append, because items_created() falls back to
+    # len(items) for profiles written before the counter existed. Counting
+    # after the append let that fallback see the bank being linked right
+    # now, and the +1 below counted it a second time -- every profile
+    # reported one Item more than it had ever spent, from its first link
+    # onward, and the Trial warning fired a bank early.
+    spent_before = config.get("items_created", 0)
     config.setdefault("items", []).append(item)
+    # Counts Items ever created, not Items currently linked. Plaid's Trial
+    # plan caps a team at 10 Items for its lifetime and /item/remove does
+    # not give a slot back, so the number that matters to a user on Trial
+    # is this one -- len(items) would under-report every bank they have
+    # linked and later removed.
+    #
+    # Sandbox Items are unlimited and spend nothing, so they must not count.
+    # That matters beyond the display: a Plaid team has one client_id across
+    # both environments, so a sandbox link that incremented this would
+    # follow the client_id into production and claim Items never really used.
+    if config.get("environment") != "sandbox":
+        config["items_created"] = max(spent_before, len(config["items"]) - 1) + 1
     save_config(config)
     print(f"Linked: {item['institution_name']} (item_id={item['item_id']})")
     return item
@@ -200,10 +257,22 @@ def index():
     return PAGE
 
 
+# The profile the open Link session belongs to. Set when the token is
+# minted and read back by the exchange: the token is tied to one Plaid
+# team, and the public_token it produces is only redeemable by that team.
+_link_target_id = None
+
+
 @app.route("/create_link_token", methods=["POST"])
 def create_link_token():
+    global _link_target_id
     config = load_config()
-    return jsonify(link_token=new_link_token(build_client(config)))
+    _link_target_id = config.get("id")
+    return jsonify(
+        link_token=new_link_token(
+            build_client(config), config.get("environment")
+        )
+    )
 
 
 @app.route("/exchange_public_token", methods=["POST"])
@@ -211,8 +280,12 @@ def exchange_public_token():
     body = request.get_json()
     # Re-read rather than holding a module-level copy: the widget may have
     # rewritten config.json (fetch_data backfills institution ids) while
-    # this page was open, and clobbering that is avoidable.
-    config = load_config()
+    # this page was open, and clobbering that is avoidable. By id, though,
+    # not by asking active() again: enabling a profile elsewhere between
+    # the two calls would exchange this token against the wrong team,
+    # Plaid would refuse it, and the Item that Link already created would
+    # be spent with its access token thrown away.
+    config = load_config(_link_target_id)
     add_item(
         build_client(config),
         config,

@@ -18,6 +18,21 @@ function fmtDate(iso) {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
+// Every string below is interpolated into a template literal that is
+// then assigned to innerHTML. Most of them come from Plaid, but the
+// profile label is a nickname typed into the setup page and the section
+// titles are hand-edited in appearance.json, so an apostrophe or a
+// stray angle bracket in either was enough to break the markup -- and a
+// typed "<img onerror=...>" ran.
+function esc(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function fmtMask(mask) {
   return mask ? `&bull;&bull;${mask}` : '';
 }
@@ -159,17 +174,33 @@ function balanceColor(balance) {
 // cards only) adds last-4 inline plus the due date pushed to the far
 // right; without it (debit cards), the caller puts last-4 on its own line
 // below instead, to keep the header row itself narrow.
+// Which profile an account came from, drawn under the bank name. Only
+// when fetch_data.py set profile_label, which it does only when more than
+// one profile is enabled: with one, every card would carry the same label
+// and it would say nothing.
+function profileTag(acc) {
+  return acc.profile_label
+    ? `<span class="profile-tag">${esc(acc.profile_label)}</span>`
+    : '';
+}
+
 function cardHead(acc, dueText) {
-  const initial = (acc.institution_name || '?').charAt(0).toUpperCase();
+  const initial = esc((acc.institution_name || '?').charAt(0).toUpperCase());
   const logo = acc.logo
-    ? `<img class="card-logo" src="${acc.logo}" alt="">`
+    ? `<img class="card-logo" src="${esc(acc.logo)}" alt="">`
     : `<span class="card-logo-fallback">${initial}</span>`;
-  const mask = dueText ? `<span class="card-mask">${fmtMask(acc.mask)}</span>` : '';
-  const due = dueText ? `<span class="due-inline">Due ${dueText}</span>` : '';
+  const mask = dueText ? `<span class="card-mask">${esc(fmtMask(acc.mask))}</span>` : '';
+  const due = dueText ? `<span class="due-inline">Due ${esc(dueText)}</span>` : '';
+  // Name and label share a column so the label lines up with the name
+  // rather than the logo. The column is a no-op when there is no label,
+  // which is the single-profile case.
   return `
     <div class="card-head">
       ${logo}
-      <span class="bank-name">${acc.institution_name}</span>
+      <span class="head-info">
+        <span class="bank-name">${esc(acc.institution_name)}</span>
+        ${profileTag(acc)}
+      </span>
       ${mask}${due}
     </div>
   `;
@@ -273,20 +304,21 @@ function distributeRowWidths(cards, creditExtra) {
 }
 
 function renderDepository(acc, width) {
-  const initial = (acc.institution_name || '?').charAt(0).toUpperCase();
+  const initial = esc((acc.institution_name || '?').charAt(0).toUpperCase());
   const logo = acc.logo
-    ? `<img class="card-logo debit-logo" src="${acc.logo}" alt="">`
+    ? `<img class="card-logo debit-logo" src="${esc(acc.logo)}" alt="">`
     : `<span class="card-logo-fallback debit-logo">${initial}</span>`;
   const grow = width ? ` style="flex:0 0 ${width.toFixed(2)}px"` : '';
   const warn = balanceColor(acc.balance);
   const warnStyle = warn ? ` style="color:${warn}"` : '';
   return `
-    <div class="card"${grow}>
+    <div class="card${acc.stale ? ' stale' : ''}"${grow}>
       <div class="card-head debit-head">
         ${logo}
         <div class="debit-info">
-          <span class="bank-name">${acc.institution_name}</span>
-          <span class="card-mask-line">${fmtMask(acc.mask)}</span>
+          <span class="bank-name">${esc(acc.institution_name)}</span>
+          ${profileTag(acc)}
+          <span class="card-mask-line">${esc(fmtMask(acc.mask))}</span>
         </div>
       </div>
       <div class="balance"${warnStyle}>${fmtMoney(acc.balance)}</div>
@@ -301,7 +333,7 @@ function renderCredit(acc) {
     ? `<span class="util-pct" style="color:${utilColor(Math.max(0, rawPct))}">${rawPct}%</span>`
     : '';
   return `
-    <div class="card credit-card">
+    <div class="card credit-card${acc.stale ? ' stale' : ''}">
       ${cardHead(acc, due)}
       <div class="balance-row">
         <div class="balance">${fmtMoney(acc.balance)}${acc.limit ? ' <span class="of-limit">/ ' + fmtMoney(acc.limit, 0) + '</span>' : ''}</div>
@@ -316,9 +348,9 @@ function renderError(err) {
   return `
     <div class="card error-card">
       <div class="card-head">
-        <span class="bank-name">${err.institution_name}</span>
+        <span class="bank-name">${esc(err.institution_name)}</span>
       </div>
-      <div class="balance msg">${err.error_message || 'Needs attention'}</div>
+      <div class="balance msg">${esc(err.error_message || 'Needs attention')}</div>
     </div>
   `;
 }
@@ -343,11 +375,31 @@ function orderKey(acc) {
   return acc.mask ? `${acc.institution_name},${acc.mask}` : `${acc.institution_name} ${acc.name}`;
 }
 
+// The keys a layout file might name this account by, best first. With two
+// profiles drawing, the order and hidden lists are namespaced by profile
+// id, because the same bank linked in both produces the same plain key and
+// one entry would move or hide two cards. The plain key stays as a
+// fallback so a single-profile layout file, or a hand-edited one, still
+// matches.
+function accountKeys(acc) {
+  const plain = orderKey(acc);
+  return acc.profile ? [`${acc.profile}:${plain}`, plain] : [plain];
+}
+
+function isHidden(acc, hidden) {
+  return accountKeys(acc).some(key => hidden.has(key));
+}
+
 function applyOrder(accounts, orderKeys) {
   const pos = new Map((orderKeys || []).map((key, i) => [key, i]));
-  const known = accounts.filter(a => pos.has(orderKey(a)))
-    .sort((a, b) => pos.get(orderKey(a)) - pos.get(orderKey(b)));
-  const unknown = accounts.filter(a => !pos.has(orderKey(a)));
+  const at = acc => {
+    for (const key of accountKeys(acc)) {
+      if (pos.has(key)) return pos.get(key);
+    }
+    return null;
+  };
+  const known = accounts.filter(a => at(a) !== null).sort((a, b) => at(a) - at(b));
+  const unknown = accounts.filter(a => at(a) === null);
   return [...known, ...unknown];
 }
 
@@ -500,6 +552,32 @@ function applyTranslucency(enabled, opacity) {
   warnAlpha = alpha(TRANSLUCENCY_TIERS.accent);
 }
 
+// appearance.json's "colors": every raw palette token, per theme. Written
+// to the raw tier rather than the derived one, exactly like the accent
+// above, so an overridden colour still goes through the translucency layer
+// instead of sitting opaque on top of it.
+//
+// Only the theme in use is written. Writing both would put the losing
+// theme's values in the element's inline style, where the stylesheet's own
+// [data-theme] rules -- less specific than an inline style -- could never
+// win them back on a theme switch.
+//
+// One interaction worth knowing: setting surface-1 here also beats the
+// dark+shadow-off rule that darkens a card face a step. That is the right
+// way round -- an explicit colour should win over an automatic adjustment
+// -- but it does mean the two shadow states stop matching in brightness.
+function applyColors(colors, dark) {
+  if (!colors) return;
+  const tokens = colors[dark ? 'dark' : 'light'];
+  if (!tokens) return;
+  const root = document.documentElement.style;
+  for (const [name, value] of Object.entries(tokens)) {
+    if (typeof value === 'string' && value) {
+      root.setProperty(`--${name}-raw`, value);
+    }
+  }
+}
+
 async function applyAppearance() {
   try {
     const res = await fetch('appearance.json', { cache: 'no-store' });
@@ -507,6 +585,7 @@ async function applyAppearance() {
     const {
       accent, scale, spacing, corner_radius, shadow, dark_theme,
       translucent_background, opacity, fetch_interval_minutes, layout,
+      colors,
     } = await res.json();
     applyShadow(shadow);
     applyTheme(dark_theme);
@@ -517,6 +596,11 @@ async function applyAppearance() {
     // --accent-raw, not --accent: the latter is derived from it (see the
     // translucency block in dashboard.html).
     if (accent) document.documentElement.style.setProperty('--accent-raw', accent);
+    // After the accent on purpose: appearance.json's "colors" block is the
+    // more specific answer -- it names a colour for one theme -- so if it
+    // sets "accent" too, that is what the person meant and it wins over
+    // the single top-level accent the Windows colour fills in.
+    applyColors(colors, dark_theme);
     if (scale) {
       document.documentElement.style.setProperty('--scale', scale);
       currentScale = scale;
@@ -599,11 +683,14 @@ async function load() {
     // Accounts switched off in the Modify page's Accounts tab. Dropped here,
     // before anything measures or lays out, so a hidden card can't widen the
     // window to make room for something that never gets drawn.
+    // 'other' alongside the drawn sections: loans and investments land
+    // there, they are not orderable, but they are switchable like anything
+    // else and reading only SECTION_TYPES here left those toggles inert.
     const hidden = new Set();
-    for (const type of SECTION_TYPES) {
+    for (const type of [...SECTION_TYPES, 'other']) {
       for (const key of (layout[type] || {}).hidden || []) hidden.add(key);
     }
-    const accounts = fetched.filter(a => !hidden.has(orderKey(a)));
+    const accounts = fetched.filter(a => !isHidden(a, hidden));
 
     if (accounts.length === 0 && errors.length === 0) {
       // Told apart on purpose: "nothing linked yet" and "you've hidden all
@@ -649,7 +736,7 @@ async function load() {
         ? `<span id="updated">${updatedText}</span>`
         : '';
       updatedPlaced = updatedPlaced || !!updatedText;
-      html += `<div class="section"><div class="section-title"><span>${sectionDef.title}</span>${updatedSpan}</div>`;
+      html += `<div class="section"><div class="section-title"><span>${esc(sectionDef.title)}</span>${updatedSpan}</div>`;
       // Depository cards are short enough content-wise (logo/name/balance,
       // no bar or due date) to fit two per row instead of wasting the right
       // half of the window on whitespace.
@@ -698,9 +785,11 @@ async function load() {
 }
 
 // Shrinks the --app window to fit the actual rendered content instead of
-// sitting at a fixed size with leftover whitespace. CSS caps body at
-// max-height: 700px, so this never grows past that even with many accounts.
-const MAX_WINDOW_HEIGHT = 700;
+// sitting at a fixed size with leftover whitespace. Height is uncapped:
+// the window is as tall as the cards need, because a ceiling here showed
+// up as the last card being cut off once enough accounts were linked.
+// #cards keeps overflow-y: auto as a fallback, but with nothing clamping
+// its height it has nothing to scroll.
 
 // Must match #cards' own width in dashboard.html -- the design-width
 // anchor that --scale (zoom) is applied against. currentExtraWidth is
@@ -725,14 +814,14 @@ function fitWindowToContent() {
       // the exposed API resizes the actual OS window directly, on both axes
       // so a scale change grows/shrinks the whole window uniformly instead
       // of just the content inside a fixed-size box.
-      window.pywebview.api.resize_window(contentWidth, Math.min(contentHeight, MAX_WINDOW_HEIGHT));
+      window.pywebview.api.resize_window(contentWidth, contentHeight);
       return;
     }
 
     // Fallback for testing in a plain browser tab (resizeTo needs the
     // chrome frame's overhead added back in).
     const frameOverhead = window.outerHeight - window.innerHeight;
-    const target = Math.min(contentHeight + frameOverhead, MAX_WINDOW_HEIGHT);
+    const target = contentHeight + frameOverhead;
     try {
       window.resizeTo(contentWidth, target);
     } catch (e) {
