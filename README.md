@@ -28,23 +28,17 @@ Users **will** have to setup a Plaid API account before using this widget,
 instructions are in the setup-script. [Plaid](https://dashboard.plaid.com) is
 what reads your balances.
 
-A new Plaid account starts on the free **Trial plan**, which covers both of
-the things this widget reads – balances and credit card details – at no cost.
-The limit is **10 linked banks**, which is plenty for a personal widget, with
-one catch worth knowing up front: that 10 counts every bank you ever link, and
-removing a bank does not give the slot back. The Accounts tab shows how many
-you have used. Trial is US/Canada only; elsewhere, or past 10 banks, Plaid
-needs a paid plan.
+- A new account is on the free **Trial plan**, which covers everything this
+  widget reads.
+- Trial allows **10 linked banks**, for the life of the account – removing a
+  bank doesn't give the slot back. The Accounts tab shows how many you've
+  used.
+- Plaid's **sandbox** is free and unlimited. Add a sandbox profile to try
+  things out with fake banks.
+- US/Canada only on Trial.
 
-Plaid's **sandbox** is free and unlimited, and the same client ID works in
-both. Add a sandbox profile (see Profiles) to try things out with fake banks
-without spending any of your 10.
-
-If you already had a Plaid account before April 2026, it sits on an older
-plan that makes you apply for production access, and Plaid has no
-self-service way to move it onto Trial. Create a new team instead (team
-switcher, top left of the dashboard → Teams → Create team) and use that
-team's keys – a team made today starts on Trial with no application.
+Had a Plaid account before April 2026? It's on an older plan – make a new
+team and use its keys. [Details in the docs](Docs/README.md#getting-started).
 
 **All information is only saved _locally_**
 
@@ -82,20 +76,14 @@ Restart and Quit.
 ### Profiles
 
 A profile is one Plaid client ID in one environment. **Advanced** on the
-Accounts tab lists them, and the tick box next to each says whether the widget
-draws it. Tick two and both appear together, each card labelled with the
-profile it came from; sandbox always runs on its own.
+Accounts tab lists them, with a tick box for whether the widget draws it.
 
-Editing a profile's secret never unlinks anything – a rotated secret keeps
-working against banks you've already linked, because Plaid ties those to the
-client ID. Changing the client ID with banks linked is refused, because the
-tokens wouldn't survive it.
-
-Unlink, reset and delete each save a **backup** first, listed under the same
-section. A backup holds that profile's credentials and its bank tokens, so
-restoring brings its banks back without spending any Items. The last five
-automatic ones are kept; ones you take yourself are kept until you delete
-them.
+- Tick two and both appear, each card labelled with its profile.
+- Sandbox always runs on its own.
+- A new secret keeps working on banks you've already linked. Changing the
+  client ID with banks linked is refused.
+- Unlink, reset and delete each save a **backup** first, listed under the
+  same section. Restoring brings that profile's banks back.
 
 One setting isn't on that page: `shadow_ui` in `config/appearance.json` gives
 the settings page's own tabs, boxes and buttons the same hard shadow the cards
@@ -109,19 +97,20 @@ distances per group, and reload the page.
 DesktopCards is listed in **Settings → Apps**, so either route works. It
 confirms first, with **Keep my settings and linked accounts** ticked – leave
 it ticked and your Plaid credentials, linked banks and appearance survive for
-a reinstall; clear it and it then offers a backup, ticked, before the folder
-goes. Leave that ticked and a restorable copy of your credentials and bank
-tokens stays behind in `%LOCALAPPDATA%\DesktopCards\backups\`; clear it and
-nothing is kept. Your banks stay linked at Plaid either way. From a checkout:
+a reinstall. Clear it and it offers a backup before the folder goes. Your
+banks stay linked at Plaid either way. From a checkout:
 `python source/desktopcards.py --uninstall`.
 
 ## Changelog
 ### Version 1.2
 - Plaid profiles
-    - Any number of client ID + environment pairs, several drawing at once
-    - Profile label under the bank name on the widget
-    - One card order across profiles, kept when a profile is switched off
-    - Backups and restore, so unlinking is undoable without spending Items
+    - Any number of client ID + environment pairs
+    - Profile label, and multi-profile selection
+    - Added Backups and restore
+- UI Changes
+    - Reload/Save bar pinned to the bottom
+    - Move 'Shortcuts' section to the Appearance Tab
+- Fixed a bug where non-credit accounts couldn't be added
 
 ### Version 1.1
 - Fresh Config UI

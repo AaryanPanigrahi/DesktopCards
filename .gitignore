@@ -76,3 +76,25 @@ newUI/
 # Trail-code (formerly Graft) codebase map and learnings. Local-only tool,
 # never shared via git.
 .trail/
+
+# Belt and braces. Everything above is matched by location, which only holds
+# while files stay where paths.py puts them. These match by name instead, so
+# a secrets.json, a backup or a log copied to the repo root while debugging
+# cannot be committed by accident.
+secrets.json
+secrets*.json
+backups/
+*.log
+*.bak
+.env
+*.exe
+
+# OS cruft.
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Re-asserted last, because the rules above are matched by name and the last
+# matching rule wins: without this, secrets*.json would swallow the tracked
+# config/secrets.example.json.
+!config/*.example.json

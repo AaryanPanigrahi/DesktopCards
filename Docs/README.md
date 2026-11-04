@@ -5,27 +5,18 @@ on Plaid for real account data.
 
 ## What it does
 
-- Pulls balances for every linked bank/credit card account via Plaid.
-- Shows checking/savings accounts (logo, bank name, last 4 digits, balance)
-  and credit cards (same, plus a usage bar and next payment due date).
-  Logos come straight from Plaid (or the bank's own favicon as a fallback).
-- Colors the numbers by how much attention they deserve: credit card
-  utilization ramps grey → yellow → deep red as it climbs, and a
-  checking/savings balance that's nearly spent or overdrawn turns yellow or
-  red (see Warning colors below).
-- Sits pinned to a fixed spot on screen as a frameless, always-on window
-  with no taskbar icon, and stays visible through Win+D ("show desktop").
-- Refreshes itself automatically – no manual resizing or repositioning
-  needed as accounts are added or removed.
-- A system tray icon gives you **Reload** (re-pull from Plaid right now),
-  **Modify** (add or remove a bank, and edit every appearance setting from
-  a page instead of by hand), **Restart** (relaunch the whole widget – for
-  settings that only apply at startup, like `survive_show_desktop`), and
-  **Quit**. The widget itself can't be clicked
-  while pinned through Win+D (see Why below), so this is the manual control
-  surface.
-- The time-since-last-refresh display also counts down the minutes left
-  until the next scheduled refresh.
+- Pulls balances for every linked account via Plaid.
+- Draws checking/savings cards (logo, bank, last 4, balance) and credit cards
+  (same, plus a usage bar and next payment due date). Logos come from Plaid,
+  falling back to the bank's favicon.
+- Colors the numbers by how much attention they deserve – see Warning colors.
+- Sits pinned to a fixed spot as a frameless, always-on window with no taskbar
+  icon, and stays visible through Win+D.
+- Resizes and repositions itself as accounts come and go.
+- Shows time since the last refresh, counting down to the next one.
+- A tray icon gives you **Reload**, **Modify**, **Restart** and **Quit**. The
+  widget can't be clicked while pinned through Win+D (see Why below), so the
+  tray is the manual control surface.
 
 ## Getting started
 
@@ -33,15 +24,21 @@ You need your own free [Plaid](https://dashboard.plaid.com) developer
 account – this uses your credentials, not someone else's. Setup walks you
 through it.
 
-New accounts land on Plaid's free Trial plan, which includes the two
-products this reads (Balance and Liabilities) and allows 10 Production
-Items. An Item is one linked bank, and the allowance is for the lifetime of
-the Plaid team: `/item/remove` does not return a slot, so a bank linked,
-removed and linked again costs two of the ten. `items_created` in
-`config.json` tracks the running total – it only counts up, which is why
-it's a separate number from `len(items)` – and the Accounts tab shows it
-against the cap. Nothing enforces the cap locally, since a paid plan lifts
-it and there's no way to tell from a client ID which plan it's on.
+New accounts land on Plaid's free Trial plan. It includes the two products
+this reads (Balance and Liabilities) and allows 10 Production Items – one
+Item is one linked bank.
+
+That 10 is for the lifetime of the Plaid team. `/item/remove` does not return
+a slot, so a bank linked, removed and linked again costs two of the ten.
+`items_created` in `config.json` is the running tally the Accounts tab shows
+against the cap; it only counts up, which is why it is separate from
+`len(items)`. Nothing enforces the cap locally – a paid plan lifts it, and a
+client ID doesn't say which plan it's on.
+
+An account made before April 2026 is on an older plan that requires applying
+for production access, with no self-service move onto Trial. Create a new team
+instead (team switcher, top left of the dashboard → Teams → Create team) and
+use that team's keys; a team made today starts on Trial.
 
 **From a packaged build** (what you'd hand to someone else):
 
@@ -88,14 +85,8 @@ that away:
 from `__file__`: under a frozen build that lands in the unpack directory and
 makes each launch look like a fresh install. Its four constants are
 `ASSET_DIR` (code and page), `DATA_DIR` (your data), `EXAMPLES_DIR` (the
-templates) and `REPO_ROOT` (the things that genuinely live at the top). From
-source the examples sit in the same folder as the live files they're
-templates for, which is the clearest place to find one to copy by hand; in the
-bundle they're flattened in with everything else, which is the only reason
-`EXAMPLES_DIR` exists separately at all.
-
-The split is not optional for a packaged build: anything written into that
-temp directory is deleted when the app exits.
+templates) and `REPO_ROOT`. The split isn't optional for a packaged build –
+anything written into the temp directory is deleted when the app exits.
 
 `%LOCALAPPDATA%\DesktopCards\` is also where the installed `DesktopCards.exe`
 and `Uninstall.exe` live, so the app, its uninstaller and its data are one
@@ -103,14 +94,12 @@ folder – which is what lets uninstalling be "delete this folder" (see
 Uninstalling).
 
 **Nothing here is written in place.** Every write goes to a `.tmp` file in the
-same folder and then `os.replace`s the real one, which is atomic on Windows as
-well as POSIX, so a crash or a full disk mid-write leaves the previous file
-whole instead of truncated. That matters most for `secrets.json`: a half-written
-one loses access to every linked bank, and unlike `data.json` it can't be
-rebuilt by fetching again. Same folder rather than the system temp dir, because
-`os.replace` is only atomic within one volume. A run killed at exactly the wrong
-moment can leave a `config.json.tmp` behind; it is ignored and overwritten, and
-gitignored so it never shows up as something to commit.
+same folder and then `os.replace`s the real one, so a crash mid-write leaves
+the previous file whole rather than truncated. That matters most for
+`secrets.json`, which unlike `data.json` can't be rebuilt by fetching again.
+Same folder rather than the system temp dir, because `os.replace` is only
+atomic within one volume. A run killed at the wrong moment can leave a
+`config.json.tmp` behind; it's ignored, overwritten and gitignored.
 
 **The gotcha worth knowing:** if you're running the packaged build, editing
 `config/appearance.json` in the repo does nothing – the exe reads the copy in
@@ -119,13 +108,6 @@ still, use the Modify page, which always writes wherever the running app
 actually reads (see Settings without editing JSON).
 
 ## Uninstalling
-
-Clearing **Keep my settings and linked accounts** brings up a second prompt
-offering a backup, ticked. Left ticked, `backups/` survives with a restorable
-copy of every profile's credentials and bank tokens; cleared, the folder goes
-with everything else. `secrets.json` is in the keep list alongside
-`config.json` for the obvious reason: keeping one without the other would
-leave a config naming banks that nothing can read.
 
 `Uninstall.exe`, written into `%LOCALAPPDATA%\DesktopCards\` beside the app
 by the install step, and listed in **Settings → Apps** so the Uninstall button
@@ -143,11 +125,18 @@ and linked accounts** is ticked by default:
 | `data.json`, `cache/`, `desktopcards.log` | deleted | deleted |
 | `%LOCALAPPDATA%\DesktopCards\` itself | stays, holding what was kept | removed |
 
-`data.json` goes either way: it's the last fetch's balances, regenerated
-within a minute of the next launch, and stale balances are the one thing
-nobody wants left behind. Either way your banks stay linked at Plaid –
-removing an Item there is irreversible and isn't something an uninstaller
-should decide (same reasoning as removing one bank from the Accounts tab).
+`secrets.json` is kept alongside `config.json` because keeping one without
+the other would leave a config naming banks nothing can read. `data.json`
+goes either way: it's the last fetch's balances, back within a minute of the
+next launch, and stale balances are the one thing nobody wants left behind.
+
+Clearing the box brings up a second prompt offering a backup, ticked. Left
+ticked, `backups/` survives with a restorable copy of every profile's
+credentials and bank tokens; cleared, it goes with everything else.
+
+Either way your banks stay linked at Plaid – removing an Item there is
+irreversible and isn't something an uninstaller should decide (same reasoning
+as removing one bank from the Accounts tab).
 
 Then, in this order, because the order is the only thing that makes it work:
 

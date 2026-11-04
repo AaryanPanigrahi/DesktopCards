@@ -74,8 +74,9 @@ through it instead of reading `config["client_id"]`.
 Plaid's Trial cap of 10 Items is per team, so it follows the client ID,
 not the profile. Two production profiles sharing a client ID share one
 allowance, and the UI sums them to show the true figure. Sandbox profiles
-count separately and never roll into it. See
-`.trail/learnings/2026-11-03-save-and-unlink-banks-is-local-aaryan.md`.
+count separately and never roll into it. Unlinking is a local wipe and
+spends nothing: it never calls `/item/remove`, because removal does not
+give a slot back on Trial.
 
 ## Behaviour
 
