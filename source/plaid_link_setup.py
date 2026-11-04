@@ -98,27 +98,39 @@ def new_link_token(client, environment=None):
 
     Also the cheapest call that proves a client_id/secret pair actually
     works, which is how setup validates credentials before saving them."""
-    # liabilities, not auth. Auth was wrong twice over: this app never reads
-    # account or routing numbers, and asking for them makes Link show only
-    # "checking, savings, and cash management accounts", which is why credit
-    # cards could not be linked at all. Balance needs no entry here -- the
-    # API rejects it as a product and initializes it alongside whatever else
-    # is asked for -- so liabilities alone covers both calls fetch_data makes.
+    # Two arrays, and the split is the whole point.
     #
-    # The cost is that Link hides institutions with no liabilities support,
-    # so a depository-only account at one of those cannot be linked. Judged
-    # the better trade than requesting transactions, whose data this never
-    # touches, purely to widen the institution list.
+    # products is what every linked Item must support, and Link enforces it
+    # against the accounts the user ticks as well as the institution. Asking
+    # for liabilities there refused a bank with only a checking account --
+    # "None of your accounts are liability accounts" -- and asking for auth
+    # instead refused a bank with only a credit card, since auth is
+    # depository-only. Neither is something this app needs: it reads balances
+    # and credit card due dates, nothing else.
     #
-    # This only affects Items created from here on: liabilities cannot be
-    # added to an existing Item by changing this, and one linked without it
-    # answers /liabilities/get with PRODUCTS_NOT_SUPPORTED until re-linked.
+    # identity is the one product every account type supports (depository,
+    # credit, loan, investment), so it is the required slot purely to satisfy
+    # "at least one product" -- the API rejects an empty array, and rejects
+    # balance outright because balance comes free with any other product.
+    # Nothing here ever calls /identity/get.
+    #
+    # liabilities moves to required_if_supported_products: initialized when
+    # the institution and the ticked accounts support it, skipped without an
+    # error when they don't. So a credit card still arrives with its due
+    # date, a checking-only bank links, and a mixed bank gets both.
+    #
+    # An Item linked without liabilities answers /liabilities/get with
+    # PRODUCTS_NOT_SUPPORTED, which fetch_data already treats as "no due
+    # dates here" rather than a failure. Products cannot be added to an
+    # existing Item by changing this, so Items linked before now keep
+    # whatever they were created with.
     user = LinkTokenCreateRequestUser(client_user_id="local-user")
     if environment == "sandbox":
         user.phone_number = SANDBOX_PROFILE_PHONE
 
     req = LinkTokenCreateRequest(
-        products=[Products("liabilities")],
+        products=[Products("identity")],
+        required_if_supported_products=[Products("liabilities")],
         client_name="Personal Balance Dashboard",
         country_codes=[CountryCode("US")],
         language="en",

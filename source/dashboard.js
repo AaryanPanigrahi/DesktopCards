@@ -33,8 +33,11 @@ function esc(value) {
     .replace(/'/g, '&#39;');
 }
 
+// Returns markup, not text: the two dots are HTML entities. So the mask
+// is escaped here and callers must not escape the result -- running esc()
+// over it turned the entities into literal "&bull;&bull;8439" on screen.
 function fmtMask(mask) {
-  return mask ? `&bull;&bull;${mask}` : '';
+  return mask ? `&bull;&bull;${esc(mask)}` : '';
 }
 
 // One warning palette for both card types: a credit card at 27-35%
@@ -189,7 +192,7 @@ function cardHead(acc, dueText) {
   const logo = acc.logo
     ? `<img class="card-logo" src="${esc(acc.logo)}" alt="">`
     : `<span class="card-logo-fallback">${initial}</span>`;
-  const mask = dueText ? `<span class="card-mask">${esc(fmtMask(acc.mask))}</span>` : '';
+  const mask = dueText ? `<span class="card-mask">${fmtMask(acc.mask)}</span>` : '';
   const due = dueText ? `<span class="due-inline">Due ${esc(dueText)}</span>` : '';
   // Name and label share a column so the label lines up with the name
   // rather than the logo. The column is a no-op when there is no label,
@@ -318,7 +321,7 @@ function renderDepository(acc, width) {
         <div class="debit-info">
           <span class="bank-name">${esc(acc.institution_name)}</span>
           ${profileTag(acc)}
-          <span class="card-mask-line">${esc(fmtMask(acc.mask))}</span>
+          <span class="card-mask-line">${fmtMask(acc.mask)}</span>
         </div>
       </div>
       <div class="balance"${warnStyle}>${fmtMoney(acc.balance)}</div>

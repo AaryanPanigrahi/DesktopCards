@@ -30,6 +30,18 @@ config/layout.merged.json.before-restore
 # config/.
 config/desktopcards.log
 
+# Transient. The cross-process migration lock sits next to config.json,
+# and every write in here is a same-directory temp file followed by
+# os.replace -- so a run killed mid-write leaves one behind. Neither is
+# ever worth committing, and cache/'s own lock is already covered above.
+config/migrate.lock
+config/*.tmp
+
+# A logo.png dropped next to config.json replaces the mark without a
+# rebuild. It's someone's own image, not the project's, unlike the
+# tracked one at the top of the checkout.
+config/logo.png
+
 __pycache__/
 *.pyc
 .venv/

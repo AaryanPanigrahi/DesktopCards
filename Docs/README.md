@@ -80,7 +80,7 @@ that away:
 | **Code and the page** (read-only) | `source/` | inside the exe, unpacked to a temp dir per launch |
 | **The examples** (`config.example.json`, `appearance.example.json`) | `config/` | bundled in the exe |
 | **`secrets.example.json`** (a template only; nothing seeds from it) | `config/` | not shipped |
-| **Your data** (`config.json`, `secrets.json`, `appearance.json`, `data.json`, the per-profile `data.<id>.json` / `layout.<id>.json`, `layout.merged.json`, `backups/`, `cache/`, `desktopcards.log`) | `config/` | `%LOCALAPPDATA%\DesktopCards\` |
+| **Your data** (`config.json`, `secrets.json`, `appearance.json`, `data.json`, the per-profile `data.<id>.json` / `layout.<id>.json`, `layout.merged.json`, `backups/`, `cache/`, `desktopcards.log`, and your own `logo.png` if you have replaced the mark) | `config/` | `%LOCALAPPDATA%\DesktopCards\` |
 | **Docs** | `Docs/` | not shipped |
 | **`logo.png`, `dist/`, the generated `.ico`** | repo root | n/a |
 
@@ -101,6 +101,16 @@ temp directory is deleted when the app exits.
 and `Uninstall.exe` live, so the app, its uninstaller and its data are one
 folder – which is what lets uninstalling be "delete this folder" (see
 Uninstalling).
+
+**Nothing here is written in place.** Every write goes to a `.tmp` file in the
+same folder and then `os.replace`s the real one, which is atomic on Windows as
+well as POSIX, so a crash or a full disk mid-write leaves the previous file
+whole instead of truncated. That matters most for `secrets.json`: a half-written
+one loses access to every linked bank, and unlike `data.json` it can't be
+rebuilt by fetching again. Same folder rather than the system temp dir, because
+`os.replace` is only atomic within one volume. A run killed at exactly the wrong
+moment can leave a `config.json.tmp` behind; it is ignored and overwritten, and
+gitignored so it never shows up as something to commit.
 
 **The gotcha worth knowing:** if you're running the packaged build, editing
 `config/appearance.json` in the repo does nothing – the exe reads the copy in
@@ -150,9 +160,10 @@ Then, in this order, because the order is the only thing that makes it work:
    stopped, not before. It fetches on a timer and writes `config.json` back
    when it does, so a backup taken while it was still running could be a
    snapshot of a file that changed a second later.
-3. **Shortcuts go** – the Start-menu entry and the Startup one. Both are just
-   files, which is why `install_autostart` uses the Startup folder rather than
-   a `Run` registry key.
+3. **Shortcuts go** – the Start-menu entry, the Startup one and the desktop
+   one. All three are just files, which is why `install_autostart` uses the
+   Startup folder rather than a `Run` registry key, and only the ones that
+   are actually there get removed.
 4. **The Add/Remove entry goes**, from `HKCU`. Nothing here needs
    administrator: shortcuts live in `%APPDATA%`, the app and its data in
    `%LOCALAPPDATA%`, and the uninstall entry in the per-user hive.
@@ -187,17 +198,17 @@ root. Paths below are given bare for readability.
 | `net_guard.py` | The one definition of "did this request really come from this machine?", shared by all three servers. Loopback binding keeps them off the network; this is what keeps the local browser from being used as a way in. See Who can reach these servers. |
 | `accent_color.py` | Reads your current Windows accent color and writes it into `appearance.json`. |
 | `desktopcards.py` | The entry point. Every mode is a flag on this one file (`--serve`, `--fetch`, `--link`, `--accent`, `--setup`, `--uninstall`, or nothing for the widget). Two modes are also selected by filename, for the copies people double-click rather than type. |
-| `setup_app.py` | First-run setup and the management view, as a local web page – credentials, Plaid Link, a verifying fetch, install and shortcuts, plus the tabbed Accounts/Appearance settings editor (see Settings without editing JSON). |
+| `setup_app.py` | First-run setup and the management view, as a local web page – credentials, Plaid Link, a verifying fetch, install and shortcuts, plus the Accounts/Layout/Appearance settings editor (see Settings without editing JSON). |
 | `uninstall.py` | Removes the app: closes a running widget, deletes the shortcuts, the Add/Remove entry and (unless you keep them) your settings, then deletes the installed exes and itself from outside the process. Reached as `Uninstall.exe`, from Settings > Apps, or with `--uninstall` (see Uninstalling). |
 | `logo_cache.py` | Caches the derived copies of `logo.png` (tray PNG, shortcut `.ico`) in `cache/`. |
 | `build.py` / `DesktopCards.spec` / `make_icon.py` | Produce `dist/DesktopCards.exe` – see Building the executable. |
-| `logo.png` | The single source of truth for the app's mark – exe icon, Start-menu shortcut, and tray icon all derive from it. At the repo root rather than in `source/`, because it's the project's own identity rather than part of the dashboard. |
+| `logo.png` | The single source of truth for the app's mark – exe icon, Start-menu shortcut, and tray icon all derive from it. At the repo root rather than in `source/`, because it's the project's own identity rather than part of the dashboard. A `logo.png` dropped next to `config.json` wins over it, which is what makes the mark changeable in an installed build without a rebuild – the bundled copy is sealed inside the exe. Gitignored, that one: it's yours, not the project's. |
 | `mac_port.md` | What a macOS port would actually involve. Planning notes, not a commitment. |
 | `appearance.json` | Appearance, window placement, and the section settings – titles and the row rules (see below). The card order and the hidden list moved out to `layout.merged.json` when profiles arrived; everything else about how the widget looks is still here. **Gitignored** – it holds your personal monitor position, same reasoning as `config.json`. |
 | `appearance.example.json` | A placeholder-position template of `appearance.json`, for the same sharing reason as `config.example.json`. |
 | `cache/logos/` | Cached institution logos (one PNG per bank). Gitignored, like `config.json`. |
 | `cache/config_snapshot.<id>.json`, `cache/appearance_snapshot.json` | One profile's items, and `appearance.json`, as of the end of the last run – how `fetch_data.py`/`widget.py` tell exactly what changed (see How a refresh actually happens). One snapshot per profile, or a first run after enabling a profile would make every bank in every other profile look new and re-fetch all their logos. The client ID and secret are stripped before writing: the snapshot only needs the items, and `cache/` is not a place to keep a second copy of your credentials. Gitignored. |
-| `config.json` | Your Plaid credentials, access tokens, and the settings below. **Gitignored** – never committed. |
+| `config.json` | Your profiles, their linked banks' access tokens, and the settings below. The client ID and secret are not here – they went to `secrets.json` when profiles arrived. **Gitignored** – never committed. |
 | `config.example.json` | A credential-free template of `config.json`, meant for sharing this tool with someone else: they copy it to `config.json` and fill in their own values rather than yours. |
 | `profiles.py` | The profile model and every file that belongs to one: `config.json`'s `profiles` block, `secrets.json`, the per-profile data/layout/snapshot files, the merged layout, and backups. Also the migration from the old flat single-credential config. Everything else goes through `resolve()`, which hands back one profile shaped exactly like that old flat config, which is why the fetch path needed no rewriting. |
 | `secrets.json` | Every profile's `client_id` and `secret`, keyed by profile id, and nothing else. **Gitignored.** Split out of `config.json` so the rest of your settings can be read or pasted into an issue without your Plaid keys going with them. |
@@ -870,7 +881,7 @@ rather than launching a brand new Python process for it, which used to
 cost more than the actual Plaid calls did.
 
 Balances always get refreshed on "Reload" – that part's never skipped.
-What *is* skipped when nothing's actually different: `cache/config_snapshot.json`
+What *is* skipped when nothing's actually different: `cache/config_snapshot.<id>.json`
 and `cache/appearance_snapshot.json` hold each file's state as of the last run,
 so `fetch_data.py` only redoes a logo lookup for an item whose
 `institution_id`/`use_custom_logo`/`logo_url` actually changed (or that's
@@ -932,12 +943,27 @@ owns it) and deserves to be reported rather than retried forever. It's bound
 before the window is created, so that failure can't produce a window pointed
 at nothing.
 
-### One lock for two callers
+### One lock in the process, one on disk
 
 The tray's "Reload" and the interval timer can both land on
 `fetch_data.main()` at the same moment, and both end by rewriting
 `config.json` and `data.json` wholesale. `fetch_data` holds a module-level
 lock so the two serialize; the loser would have been wasted work anyway.
+
+That only covers callers inside the widget's process, and the setup page runs
+in its own. Switching which profiles are enabled while a fetch is in flight
+would have it write the old set's numbers into `data.json` after the switch, so
+a fetch also writes `cache/fetch.lock` for as long as it runs and setup waits
+on it. A lock older than ten minutes is read as a process that died holding it
+and ignored – and because the check is on the file's mtime, each profile's
+pass touches it, so "stale" keeps meaning dead rather than slow on an install
+with several profiles. The reader never deletes it; the next real fetch
+overwrites it anyway.
+
+The one-time migration out of the old flat config has its own, `migrate.lock`,
+taken with `O_CREAT | O_EXCL` so the widget and the setup page starting
+together can't both run it. Two minutes of staleness there, since a migration
+is two small writes. Both are gitignored.
 
 ## Building the executable
 
@@ -1092,10 +1118,11 @@ your browser and walks through five steps:
    everything before it can succeed and still leave you looking at an empty
    widget, and this is where that becomes a message instead of a mystery.
 4. **Install.** Copies the exe to `%LOCALAPPDATA%\DesktopCards\` and writes
-   a Start-menu shortcut, optionally a Startup one.
+   a Start-menu shortcut, optionally a Startup one. Which shortcuts exist is
+   editable afterwards, on the Appearance tab.
 5. **Launch.**
 
-Run it again and it skips to a **management view** instead, which is two
+Run it again and it skips to a **management view** instead, which is three
 tabs (see Settings without editing JSON below).
 
 The page is served on localhost only, and `/api/state` deliberately carries
@@ -1110,6 +1137,29 @@ long enough for the response to land. The tab itself can't be closed
 programmatically – browsers only allow that for a window a script opened, and
 this one came from `webbrowser.open` – so the page says to close it instead of
 pretending.
+
+### What Link asks Plaid for
+
+The link token names `products=[identity]` and
+`required_if_supported_products=[liabilities]`, which looks like the wrong
+way round until you know what `products` means: Link enforces it against the
+accounts you tick, not just against the bank. Asking for `liabilities` there
+refused a bank with only a checking account – *"No Liability Accounts"* –
+and `auth` refused one with only a credit card. Neither refusal was right:
+both accounts are perfectly drawable.
+
+`products` cannot be empty, so something has to fill it, and `identity` is
+the only product every account type supports. Nothing in this project calls
+`/identity/get`; it is there to hold the slot. Liabilities, the product that
+actually matters, moves to `required_if_supported_products`, which asks for
+it where the bank has it and stays quiet where it doesn't.
+
+An Item linked without liabilities answers `PRODUCTS_NOT_SUPPORTED` when
+`fetch_data` asks for due dates, which it already treats as "this bank has
+none" rather than as an error – a checking-only bank draws its balance and
+nothing is said about it. Worth knowing: a product cannot be added to an
+Item after the fact. Changing this list changes what *new* links ask for,
+and re-linking a bank to widen it spends another of the ten Trial Items.
 
 ### The server goes when the page does
 
@@ -1194,11 +1244,45 @@ page on each click of a checkbox. A theme that changes before it's saved is
 also claiming something that isn't true yet, so the save handler is now the
 one place the page's own palette changes.
 
-**Accounts** carries the linked banks (add, remove, redo shortcuts, launch or
-restart the widget, start-with-Windows), and under it the individual accounts
-the last fetch returned, grouped into the same Checking & Savings / Credit
-Cards sections the widget draws. "Chase" on its own never said whether that
-bank brought one checking account or three cards; this does.
+### One ribbon at the foot, one box per section
+
+Every button a tab has is latched to a bar at the bottom of the window, and
+which buttons are drawn comes from the tab you're on – a button that can't do
+anything here is better absent than present and disabled. The message line
+lives in the bar too, left of the buttons, because the result of pressing one
+belongs beside it. The wizard keeps its own buttons: those five steps are a
+sequence, and each step's button belongs to that step.
+
+One exception, and it's a rule rather than an oversight: **Add a bank** stays
+in the Linked banks box. It acts on that list, not on the tab.
+
+Inside a tab, each section is its own box in a two-column grid rather than
+one long box with rules across it. A single box made every section as wide as
+the widest one; separate boxes let "Accounts on the widget" sit beside
+"Linked banks". The boxes are measured and packed by height, so a short one
+doesn't leave a hole under it, and the two columns are evened at the bottom.
+Packing needs JavaScript, so it's a class the script adds – without it this
+degrades to a plain two-column grid, which is a worse layout rather than a
+broken one. Below 900px it's one column and there is nothing to pack.
+
+Two boxes are pinned rather than packed: the box a tab is *about* stays at the
+top left, and the full-width ones (Advanced, Backups) keep the order they're
+written in. Sorting those by height put Backups above Advanced, which is
+nonsense – one is the toggle for the other.
+
+**Accounts** carries the linked banks (add, remove) and, beside it, the
+individual accounts the last fetch returned, grouped into the same Checking &
+Savings / Credit Cards sections the widget draws. "Chase" on its own never
+said whether that bank brought one checking account or three cards; this
+does.
+
+Its ribbon is a single **Save**, with **Reload and Restart** on the arrow
+beside it. Everything on this tab writes the moment you change it, so what's
+left for a button to do is pull fresh balances and redraw the lists – which
+is what Save does. The fetch comes before the restart, in that order and for
+the same reason it does on Appearance: the widget reads `data.json` as it
+comes up, so fetching first means it draws the new balances immediately
+rather than the previous ones.
 
 **No balances anywhere in this view, deliberately.** It opens in an ordinary
 browser tab, and a tab showing real account balances reads as a banking site –
@@ -1209,8 +1293,8 @@ which the Layout tab needs to say whether a balance is wide enough to break a
 card onto its own row, and which is never rendered as money.
 
 Each account has a tickbox for whether the widget draws it at all. Unticking
-writes the key into `layout.<section>.hidden` and the card disappears on the
-next refresh; the account stays linked and keeps its place in the order, so
+writes the account's `<profile id>:Bank,last4` key into that section's hidden
+list in `layout.merged.json` and the card disappears on the next refresh; the account stays linked and keeps its place in the order, so
 ticking it back puts it where it was. Hidden accounts are filtered out before
 the dashboard measures anything, so a hidden card can't widen the window to
 make room for something that never gets drawn. If you hide everything, the
@@ -1222,15 +1306,36 @@ exist, and `hidden` is not. A bank that errors on one fetch drops out of
 `data.json`, and pruning `hidden` would quietly switch an account back on –
 the worse of the two failures, so stale keys are left to sit there.
 
-Its **Advanced** block is collapsed by default and holds the things that
-aren't day-to-day: the Plaid environment, client ID and secret. Saving there
-**unlinks every bank**, and the page warns before it does. That isn't
-caution for its own sake – an access token is only valid for the client ID
-and environment it was created under, so banks linked under the old ones
-would error on every fetch rather than carry over. Both credential fields
-start blank and blank means "keep the saved one", so switching environment
-alone doesn't mean re-copying a secret out of the Plaid dashboard. They start
-blank rather than pre-filled for the same reason `/api/state` omits them.
+Its **Advanced** block is collapsed by default and holds the profiles: one
+Plaid client ID in one environment each. Every row gives the profile's name,
+its environment and the last 4 of its client ID, and how many banks it has
+linked; the tickbox is whether the widget draws it. Several production
+profiles can be on at once, a sandbox one runs alone, and ticking a sandbox
+profile switches the others off – test data and real balances on one widget
+is a way to misread your own money. A profile whose production team has
+reached the Trial cap says so on the row, without claiming to know which plan
+that team is on, because nothing here can tell.
+
+Opening a row gives its nickname, client ID and secret, and **Unlink banks**,
+**Reset sandbox** and **Delete profile** – each one backing up first. Saving
+credentials there never unlinks anything: an access token is tied to the
+client ID rather than the secret, so a rotated secret keeps working against
+the same banks. Pointing a profile that has banks at a *different* client ID
+is refused instead, since those tokens would error on every fetch from then
+on; that is a second team, and **Add profile** is what it's for. The
+environment is only set at Add, for the same reason.
+
+Both credential fields start blank and blank means "keep the saved one", so
+rotating one doesn't mean re-copying the other out of the Plaid dashboard.
+They start blank rather than pre-filled because the page is never sent them:
+`/api/state` and `/api/profiles` hand back the last 4 of the client ID and
+nothing else, so a secret can't leak into a browser tab, its history or a
+screenshot. **Backups** sits underneath, listing the restore points (see
+Backups).
+
+With two or more profiles drawing, **Add a bank** asks which one the new bank
+belongs to. With one it doesn't: there is nothing to choose, and a question
+about a concept you aren't using is worse than silence.
 
 **Layout** is the card order, by drag. Each section is its own list, and
 that's a constraint rather than an omission: which section a card lands in
@@ -1268,15 +1373,16 @@ the one that went wrong. Two guards sit behind that:
   save endpoint takes `layout` from disk rather than from the request. The
   Appearance tab has no layout fields, so it has no business writing them.
 
-**Appearance** is every remaining key in `appearance.json`, in the order the
-file has them, generated from one field spec rather than twenty hand-written
-form rows.
+**Appearance** is every remaining key in `appearance.json`, generated from
+one field spec rather than twenty hand-written form rows – one box per
+heading in that spec, packed like the rest.
 Fields that only matter while another is on (per-side `spacing` under
 `custom_spacing`, the `shadow` sizes under `shadow.enabled`) grey out rather
 than disappear, since the value is still in the file and hiding it would read
 as the setting having gone away. Anything `widget.py` reads once at launch
 (`window.x`/`y`, `survive_show_desktop`, `translucent_background`) is marked
-**restart**, which is also what the tab's **Restart Widget** button is for.
+**restart**, which is what **Save and Restart**, on the arrow beside Save, is
+for.
 
 Three details worth knowing:
 
@@ -1290,6 +1396,25 @@ Three details worth knowing:
   so there's one definition of "default" rather than a second copy in Python.
 - **A blank shadow color deletes the key** instead of writing `""`, because
   absent is what means "follow the theme" (see Card shadow).
+
+The one box here that isn't `appearance.json` is **Shortcuts**: start with
+Windows, a Start-menu entry and a desktop shortcut, each naming the folder it
+writes to. They're files on disk rather than settings, but they follow the
+tab's rule anyway – a tick is pending until Save, so a stray click is undone
+by not saving, and **Restore to Default** leaves them alone since it only
+knows about `appearance.json`. Save writes them only when a tick actually
+moved: an install recopies the exe, which is not work a save that changed a
+corner radius should be doing. **Redo shortcuts** on the same ribbon rewrites
+all three from the ticks, which is the fix for a shortcut pointing at an exe
+that has since moved.
+
+The desktop folder is read from the shell's own setting rather than assumed
+to be `%USERPROFILE%\Desktop`. OneDrive's "back up your Desktop" moves it, and
+a shortcut written to the old path lands somewhere nobody looks.
+
+`/api/install` treats a missing flag as "leave that shortcut alone" rather
+than as false. The wizard's install posts only `autostart`, and it must not
+delete a desktop shortcut it was never asked about.
 
 ### The layout order now names your actual banks
 
@@ -1413,9 +1538,9 @@ single-instance lock would then block the next launch.
 
 ### Only one widget at a time
 
-The app is launched from a Start-menu shortcut, a Startup shortcut, and
-setup's Launch button, so a second instance is an ordinary event rather than
-a mistake. `claim_single_instance` takes a named mutex before anything
+The app is launched from a Start-menu shortcut, a Startup shortcut, a desktop
+shortcut and setup's Launch button, so a second instance is an ordinary event
+rather than a mistake. `claim_single_instance` takes a named mutex before anything
 touches the port; a second instance logs *"Already running"* and exits 0.
 
 Without it the second process got as far as binding port 5000, failed, and

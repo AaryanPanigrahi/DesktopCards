@@ -109,10 +109,12 @@ BUNDLED_LOGO_PATH = os.path.join(REPO_ROOT, "logo.png")
 ICON_PATH = os.path.join(REPO_ROOT, "DesktopCards.ico")
 DIST_DIR = os.path.join(REPO_ROOT, "dist")
 
-# A logo dropped in DATA_DIR wins over the bundled one. From source these
-# are the same file, so editing logo.png in the repo just works. Frozen,
-# the bundled copy is sealed inside the exe, and this is what makes the
-# mark changeable without a rebuild: drop a logo.png next to config.json.
+# A logo dropped in DATA_DIR wins over the bundled one. Two different
+# files either way: from source the bundled mark is logo.png at the top of
+# the checkout, which is tracked, and this one is config/logo.png, which
+# is not. Frozen, the bundled copy is sealed inside the exe, and this is
+# what makes the mark changeable without a rebuild: drop a logo.png next
+# to config.json.
 USER_LOGO_PATH = os.path.join(DATA_DIR, "logo.png")
 
 

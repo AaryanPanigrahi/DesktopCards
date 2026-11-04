@@ -222,6 +222,34 @@ def startup_dir():
     )
 
 
+def desktop_dir():
+    r"""The user's Desktop, as the shell itself has it.
+
+    Not %USERPROFILE%\Desktop: OneDrive's "back up your Desktop" moves the
+    folder, and a shortcut written to the old path lands somewhere nobody
+    looks. The registry value is the shell's own answer, so it follows."""
+    import winreg
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+        ) as key:
+            value = winreg.QueryValueEx(key, "Desktop")[0]
+        if value:
+            return os.path.expandvars(value)
+    except OSError:
+        pass
+    return os.path.join(os.environ["USERPROFILE"], "Desktop")
+
+
+def start_menu_path(name="DesktopCards"):
+    return os.path.join(start_menu_dir(), f"{name}.lnk")
+
+
+def desktop_path(name="DesktopCards"):
+    return os.path.join(desktop_dir(), f"{name}.lnk")
+
+
 def create_shortcut(link_path, target, arguments="", icon=None,
                     working_dir=None, description=None):
     """Writes a .lnk via the shell's own COM object, driven by PowerShell.

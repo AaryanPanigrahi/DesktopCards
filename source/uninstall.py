@@ -170,11 +170,14 @@ def widget_answers(port):
 
 
 def remove_shortcuts():
-    """The Start-menu entry and the Startup one. Both are files."""
+    """The Start-menu entry, the Startup one and the desktop one. All
+    three are files, and all three are optional -- only the ones that are
+    actually there get removed."""
     n = native()
     gone = []
-    for path in (os.path.join(n.start_menu_dir(), f"{APP_NAME}.lnk"),
-                 n.autostart_path(APP_NAME)):
+    for path in (n.start_menu_path(APP_NAME),
+                 n.autostart_path(APP_NAME),
+                 n.desktop_path(APP_NAME)):
         if os.path.exists(path) and n.remove_shortcut(path):
             gone.append(os.path.basename(path))
     print(f"[uninstall] shortcuts removed: {gone or 'none found'}")

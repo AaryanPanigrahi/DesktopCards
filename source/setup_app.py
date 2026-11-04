@@ -732,6 +732,13 @@ def api_state():
         data_dir=DATA_DIR,
         installed=os.path.exists(installed_exe_path()) if FROZEN else True,
         autostart=os.path.exists(native().autostart_path(APP_NAME)),
+        start_menu=os.path.exists(native().start_menu_path(APP_NAME)),
+        desktop=os.path.exists(native().desktop_path(APP_NAME)),
+        shortcut_dirs={
+            "startup": native().startup_dir(),
+            "start_menu": native().start_menu_dir(),
+            "desktop": native().desktop_dir(),
+        },
         running=widget_is_running(),
         groups=account_summary(),
         # Served rather than hardcoded in the page, so the interval and the
@@ -1719,9 +1726,15 @@ def install_uninstaller():
 def api_install():
     body = request.get_json(silent=True) or {}
     autostart = bool(body.get("autostart"))
+    # Absent is not the same as false. The wizard's install posts only
+    # autostart, and it must not delete a shortcut it never asked about --
+    # so a missing key leaves that shortcut alone, except for the
+    # Start-menu one, which an install has always created.
+    want_start_menu = body.get("start_menu", True)
+    want_desktop = body.get("desktop", None)
     n = native()
-    result = {"app_path": None, "start_menu": None, "startup": None,
-              "uninstaller": None}
+    result = {"app_path": None, "start_menu": None, "desktop": None,
+              "startup": None, "uninstaller": None}
 
     seed_data_dir()
 
@@ -1738,14 +1751,25 @@ def api_install():
     # lives in the Python install -- the working directory has to be the
     # project, or the "desktopcards.py" argument resolves to nothing.
     working_dir = os.path.dirname(exe) if FROZEN else ASSET_DIR
-    result["start_menu"] = n.create_shortcut(
-        os.path.join(n.start_menu_dir(), f"{APP_NAME}.lnk"),
-        target=exe,
-        arguments=args,
-        icon=icon,
-        working_dir=working_dir,
-        description="DesktopCards balance widget",
-    )
+
+    def shortcut(path, wanted):
+        """Writes the shortcut, removes it, or leaves it as it is."""
+        if wanted is None:
+            return path if os.path.exists(path) else None
+        if not wanted:
+            n.remove_shortcut(path)
+            return None
+        return n.create_shortcut(
+            path,
+            target=exe,
+            arguments=args,
+            icon=icon,
+            working_dir=working_dir,
+            description="DesktopCards balance widget",
+        )
+
+    result["start_menu"] = shortcut(n.start_menu_path(APP_NAME), want_start_menu)
+    result["desktop"] = shortcut(n.desktop_path(APP_NAME), want_desktop)
     result["startup"] = n.install_autostart(
         autostart, exe, arguments=args, icon=icon, name=APP_NAME,
         working_dir=working_dir,
@@ -1897,6 +1921,9 @@ PAGE = r"""<!doctype html>
        needs a fill that reads as raised against it and a hover a step
        further again, which is one more level than the card tokens have. */
     --btn-bg: #262b34; --btn-bg-hover: #2f3540; --btn-line: #363d49;
+    /* The section grid: the space between boxes, and the granularity
+       their heights are rounded up to. */
+    --gap: 16px; --row-unit: 4px;
     --tick: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'><path d='M20 6 9 17l-5-5'/></svg>");
     --dash: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3.5' stroke-linecap='round'><path d='M6 12h12'/></svg>");
     /* The hard offset shadow these controls draw, borrowed from the
@@ -1950,40 +1977,100 @@ PAGE = r"""<!doctype html>
      empty on either side. main.manage is set by loadState once it knows
      which of the two the page is. */
   main { width: 100%; max-width: 620px; }
-  main.manage { max-width: 1060px; }
-
-  /* The appearance form's groups, balanced into two columns. CSS columns
-     rather than a grid because there are a dozen groups of a dozen
-     different heights: columns fill to an equal stack height, where a grid
-     would make every row as tall as its tallest cell. */
-  .cols { columns: 2; column-gap: 1.6rem; }
-  /* Spacing between groups hangs off the bottom of each block, never the
-     top: a top margin on whichever block happens to land at the head of
-     the second column would push that column out of line with the first,
-     and which block that is isn't knowable from here. */
-  .colblock { break-inside: avoid; margin-bottom: 1.5rem; }
-  .colblock:last-child { margin-bottom: 0; }
-  .colblock > h3.grp:first-child { margin-top: 0; }
-
-  /* Two halves, one each, where that's what the content is -- the accounts
-     tab ("linked banks and what to do with them" | "which of their
-     accounts get drawn") and the layout tab ("what each section is called
-     and when it breaks a row" | the lists you drag). A grid, not columns:
-     with exactly two blocks, balancing could decide they both fit in the
-     first column and leave the second empty. */
-  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1.8rem; }
-  .split > * { min-width: 0; }
+  main.manage { max-width: 1060px; padding-bottom: 4.5rem; }
 
   /* For blocks that stay single-column on a wide page: a label/control row
      stretched to 1060px leaves its two halves at opposite ends of the
      window with nothing in between. */
   .narrow { max-width: 560px; }
 
+  /* ---- a tab's sections, each in its own box ----
+     Borrowed from DesktopTasks' settings page. A tab used to be one card
+     with its sections ruled off inside it, which made a long strip where
+     every section had to be as wide as the widest one. Now each section
+     is its own box in a two-column grid, so "Accounts on the widget" can
+     sit beside "Linked banks" rather than under it.
+
+     The row bins are what stop a short box being stretched to the height
+     of whatever is next to it: settings.js-style, buildBins() measures
+     each box and rounds it up to a whole number of --row-unit rows, then
+     `dense` backfills the holes. Binning needs JS, so it is a class the
+     script adds -- without it this is an ordinary two-column grid where
+     each row is as tall as its tallest box. A worse layout, not a broken
+     one. */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-auto-flow: row dense;
+    gap: var(--gap);
+    /* start, so a box is its own content's height: that is the state the
+       measuring happens in, and a stretched box would measure as tall as
+       the tallest one beside it. */
+    align-items: start;
+  }
+  /* Binned, stretch instead, so the rounding shows as nothing at all
+     rather than as a strip of page under each box. */
+  .grid.binned { grid-auto-rows: var(--row-unit); align-items: stretch; }
+  .grid.binned > .card { grid-row: span var(--span, 1); }
+  .card.wide { grid-column: span 2; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 1.1rem 1.25rem;
+    /* The grid's gap spaces them, and a margin would be measured into the
+       height and inflate the row span. */
+    margin-bottom: 0;
+    min-width: 0;
+  }
+  .card > h3.grp:first-child { margin-top: 0; }
+  .card > :last-child { margin-bottom: 0; }
+
+  /* A tab is now a frame around the grid rather than a card itself. */
+  section.panel {
+    background: none; border: 0; padding: 0; margin-bottom: 0;
+  }
+  section.panel > .hint { margin-left: 0; }
+
+  /* ---- the bottom ribbon ----
+     Every button a tab has, latched to the foot of the window instead of
+     to the bottom of whichever box it happened to belong to. Which ones
+     show is the tab's business: a button that cannot do anything on this
+     tab is better not drawn at all than drawn disabled.
+
+     The message line lives here too, left of the buttons, because the
+     result of pressing one belongs beside it -- and with the buttons out
+     of the boxes there is nowhere above for it to go. One line per tab
+     rather than one shared: each tab's script already writes to its own,
+     and only the active tab's is drawn. */
+  .savebar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+    background: var(--card); border-top: 1px solid var(--line);
+    padding: .75rem 1rem;
+  }
+  .savebar[hidden] { display: none; }
+  .savebar .inner {
+    max-width: 1060px; margin: 0 auto;
+    display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+  }
+  /* Takes the slack, which is what keeps the buttons at the right end
+     once there is something to say. */
+  .savebar .msg { margin: 0 auto 0 0; flex: 1; min-width: 0; text-align: left; }
+  .savebar .msg[hidden] { display: none; }
+  .savebar .acts {
+    display: none; gap: .6rem; align-items: center; flex-wrap: wrap;
+    margin: 0; padding: 0; border-top: 0;
+  }
+  .savebar .acts.on { display: flex; }
+  .savebar button { margin-top: 0; }
+  /* Opens upward: the bar is at the foot of the window, so the default
+     drop below it would be off screen. */
+  .savebar .menu { top: auto; bottom: calc(100% + .35rem); }
+
   /* Below this a column is too narrow for a .fld's label and its control
      side by side, which is the shape of nearly every row in these forms. */
   @media (max-width: 900px) {
-    .cols { columns: 1; }
-    .split { grid-template-columns: 1fr; }
+    .grid { grid-template-columns: minmax(0, 1fr); }
+    .card.wide { grid-column: span 1; }
   }
   h1 { font-size: 1.5rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
   .sub { color: var(--dim); margin: 0 0 2rem; }
@@ -2457,6 +2544,13 @@ PAGE = r"""<!doctype html>
   }
   .fld > .lbl { flex: 1 1 auto; font-size: .9rem; }
   .fld > .lbl .sub2 { display: block; color: var(--faint); font-size: .78rem; }
+  /* The shortcut folders are the only labels holding a run of text with
+     nowhere to break -- a path has no spaces until "Start Menu". A flex
+     item is min-width:auto, so that run set the row's minimum and pushed
+     the switch out through the side of the box. Breaking the path and
+     letting the label shrink keeps it in. */
+  #shortcutsCard .fld > .lbl { min-width: 0; }
+  #shortcutsCard .fld .sub2 { overflow-wrap: anywhere; }
   /* One width for every row's control column, so the boxes line up on
      their left edge as well as their right. A picker or a slider gets no
      extra room: widening those rows was what pushed the accent box and
@@ -2506,7 +2600,6 @@ PAGE = r"""<!doctype html>
   .acts { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center;
           margin-top: 1.4rem; padding-top: 1.1rem; border-top: 1px solid var(--line); }
   .acts button { margin-top: 0; }
-  .acts .right { margin-left: auto; display: flex; gap: .6rem; flex-wrap: wrap; }
   /* A table, so the tick, the bank and the account line up down the page
      instead of every row laying itself out between two flex ends. Separate
      borders with a row gap rather than collapse: a collapsed table can't
@@ -2641,87 +2734,64 @@ PAGE = r"""<!doctype html>
     </button>
   </nav>
 
-  <section id="tab-accounts" hidden>
-    <h2><span class="num">&#10003;</span> Linked banks</h2>
-    <p class="hint">
-      Add another bank, or remove one. Removing one forgets it here and
-      leaves the bank linked at Plaid, so adding it back later is just
-      another sign-in &ndash; but on the free Trial plan that sign-in spends
-      another of your 10 banks rather than reusing the old one. The account
-      list is what the last fetch returned, grouped into the sections the
-      widget draws them in; new banks join it after the next refresh.
-    </p>
-    <div class="body">
-      <div class="split">
-        <div>
-          <ul class="banks" id="bankList"></ul>
-          <p class="hint2" id="trialUse"></p>
-          <p class="hint2" id="sandboxCreds" hidden>
-            Sandbox: phone <code>+14155550138</code> (prefilled), code
-            <code>123456</code>, then <code>user_good</code> /
-            <code>pass_good</code> &ndash; or <code>user_loan_loc</code> for
-            a credit card with a due date.
-          </p>
-          <!-- Hidden unless two or more profiles are enabled: with one
-               there is nothing to choose, and an unnecessary question
-               about a concept you are not using is worse than silence. -->
-          <div class="row" id="linkTarget" hidden></div>
-          <div class="row">
-            <button class="solid" id="addBank">Add a bank</button>
-            <button id="reinstall">Redo shortcuts</button>
-            <!-- Plain, not solid: "Add a bank" is the one thing this tab is
-                 for, and two filled buttons in a row argue over which. -->
-            <span class="menu-root">
-              <span class="btn-group">
-                <button id="reloadWidget">Reload widget</button>
-                <button id="reloadMenuBtn" aria-haspopup="menu"
-                        aria-expanded="false" aria-label="More reload options">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="m6 9 6 6 6-6"/>
-                  </svg>
-                </button>
-              </span>
-              <div class="menu" id="reloadMenu" role="menu" hidden>
-                <button role="menuitem" id="reloadRestart">Reload and Restart</button>
-              </div>
-            </span>
-          </div>
-          <p class="hint" id="notInstalled" hidden style="margin:.9rem 0 0">
-            Not installed yet, so there's no Start-menu shortcut either.
-            Launching or redoing shortcuts creates both.
-          </p>
-          <div class="check">
-            <input type="checkbox" id="autostartManage">
-            <label for="autostartManage" style="margin:0">Start with Windows</label>
-          </div>
-          <div class="msg" id="manageMsg"></div>
-        </div>
-        <div>
-          <h3 class="grp" style="margin-top:0">Accounts on the widget</h3>
-          <p class="hint2">
-            Untick one to leave it off the widget &ndash; it stays linked,
-            it just isn't drawn.
-          </p>
-          <div id="groups"></div>
+  <section id="tab-accounts" class="panel" hidden>
+    <div class="grid" data-panel="accounts">
+
+      <div class="card" data-first>
+        <h3 class="grp">Linked banks</h3>
+        <p class="hint2">
+          Removing a bank forgets it here and leaves it linked at Plaid, so
+          adding it back later is another sign-in &ndash; which on the free
+          Trial plan spends another of your 10 banks rather than reusing the
+          old one.
+        </p>
+        <ul class="banks" id="bankList"></ul>
+        <p class="hint2" id="trialUse"></p>
+        <p class="hint2" id="sandboxCreds" hidden>
+          Sandbox: phone <code>+14155550138</code> (prefilled), code
+          <code>123456</code>, then <code>user_good</code> /
+          <code>pass_good</code> &ndash; or <code>user_loan_loc</code> for
+          a credit card with a due date.
+        </p>
+        <!-- Hidden unless two or more profiles are enabled: with one
+             there is nothing to choose, and an unnecessary question
+             about a concept you are not using is worse than silence. -->
+        <div class="row" id="linkTarget" hidden></div>
+        <!-- The one button that stays out of the ribbon. It acts on this
+             list rather than on the tab, and the ribbon is for the tab. -->
+        <div class="row">
+          <button class="solid" id="addBank">Add a bank</button>
         </div>
       </div>
 
-      <h3 class="grp">Advanced</h3>
-      <div class="check" style="margin-top:.3rem">
-        <input type="checkbox" id="advToggle">
-        <label for="advToggle" style="margin:0">Show/Add Plaid profiles</label>
-      </div>
-      <div id="advanced" hidden>
+      <div class="card">
+        <h3 class="grp">Accounts on the widget</h3>
         <p class="hint2">
-          A profile is one Plaid client ID in one environment. Tick the ones
-          to draw. Sandbox runs on its own.
+          Untick one to leave it off the widget &ndash; it stays linked,
+          it just isn't drawn.
         </p>
-        <div id="profileList"></div>
-        <div class="foot">
-          <div class="msg" id="advMsg"></div>
-          <button id="addProfile">Add profile</button>
+        <div id="groups"></div>
+      </div>
+
+      <!-- Both boxes below are full width and sorted to the end: a
+           profile row opens into a form, and the backup list is a log.
+           Neither reads as a column of settings beside another. -->
+      <div class="card wide" data-last>
+        <h3 class="grp">Advanced</h3>
+        <div class="check" style="margin-top:.3rem">
+          <input type="checkbox" id="advToggle">
+          <label for="advToggle" style="margin:0">Show/Add Plaid profiles</label>
         </div>
+        <div id="advanced" hidden>
+          <p class="hint2">
+            A profile is one Plaid client ID in one environment. Tick the ones
+            to draw. Sandbox runs on its own.
+          </p>
+          <div id="profileList"></div>
+          <div class="foot">
+            <div class="msg" id="advMsg"></div>
+            <button id="addProfile">Add profile</button>
+          </div>
         <!-- Same stacked shape as step 1, because this is a form you fill
              in rather than a row of settings you scan. -->
         <div class="narrow" id="newProfile" hidden>
@@ -2756,7 +2826,11 @@ PAGE = r"""<!doctype html>
           </div>
         </div>
 
-        <h4 class="grp2">Backups</h4>
+        </div>
+      </div>
+
+      <div class="card wide" id="backupsCard" data-last hidden>
+        <h3 class="grp">Backups</h3>
         <p class="hint2">
           A backup holds a profile's secret and its bank tokens, so
           restoring brings its banks back without spending Plaid Items.
@@ -2768,71 +2842,56 @@ PAGE = r"""<!doctype html>
           <button id="backupNow">Back up now</button>
         </div>
       </div>
+
     </div>
   </section>
 
-  <section id="tab-layout" hidden>
-    <h2>Layout</h2>
+  <section id="tab-layout" class="panel" hidden>
     <p class="hint">
-      Drag a card to move it. Each section is its own list &ndash; which
-      section a card lands in comes from the account type, not a preference,
-      and the widget draws the two kinds differently. Everything on this tab
-      saves as soon as you change it. What each section is called and when
-      it breaks a card onto its own row are on the left.
+      Drag a card to move it. Each widget section is its own list &ndash;
+      which one a card lands in comes from the account type, not a
+      preference. Everything here saves as soon as you change it.
     </p>
-    <div class="body">
-      <!-- Settings left, cards right: the lists are the thing you came
-           here to drag, so they get a column to themselves rather than
-           three text fields interleaved between them. -->
-      <div class="split">
-        <div id="layoutRules"></div>
-        <div id="layoutSections"></div>
-      </div>
-      <div class="acts">
-        <button id="undoLayout" disabled>Undo last move</button>
-        <span class="right">
-          <button id="restartLayout">Restart Widget</button>
-        </span>
-      </div>
-      <div class="msg" id="layoutMsg"></div>
-    </div>
+    <!-- One box per widget section, built by renderLayout: its heading,
+         its row rules, then its cards. The rules used to be gathered in a
+         column of their own so the lists were an uninterrupted run of
+         drag targets; with a box per section they sit at the top of the
+         box they belong to, which says the same thing more directly. -->
+    <div class="grid" id="layoutSections" data-panel="layout"></div>
   </section>
 
-  <section id="tab-appearance" hidden>
-    <h2>Appearance</h2>
+  <section id="tab-appearance" class="panel" hidden>
     <p class="hint">
-      The widget's settings from <code>appearance.json</code>, in the order
-      they appear there &ndash; card order and section headings are on the
-      Layout tab instead. Most of it takes effect the next time the
-      widget's page loads;
-      anything marked <span class="badge">restart</span> is read once at
-      launch, so save it with <em>Save and Restart</em> from the arrow next
-      to Save.
+      The widget's settings from <code>appearance.json</code>, plus the
+      Windows shortcuts &ndash; card order and section headings are on the
+      Layout tab instead. Most of it
+      takes effect the next time the widget's page loads; anything marked <span class="badge">restart</span>
+      is read once at launch, so save it with <em>Save and Restart</em> from
+      the arrow next to Save.
     </p>
-    <div class="body">
-      <div class="cols" id="appearanceForm"></div>
-      <div class="acts">
-        <button id="restoreAppearance">Restore to Default</button>
-        <span class="right">
-          <span class="menu-root">
-            <span class="btn-group">
-              <button class="solid" id="saveAppearance">Save</button>
-              <button class="solid" id="saveMenuBtn" aria-haspopup="menu"
-                      aria-expanded="false" aria-label="More save options">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="m6 9 6 6 6-6"/>
-                </svg>
-              </button>
-            </span>
-            <div class="menu" id="saveMenu" role="menu" hidden>
-              <button role="menuitem" id="saveRestart">Save and Restart</button>
-              <button role="menuitem" id="saveReloadRestart">Reload and Restart</button>
-            </div>
-          </span>
-        </span>
+    <div class="grid" id="appearanceForm" data-panel="appearance">
+      <div class="card" id="shortcutsCard">
+        <h3 class="grp">Shortcuts</h3>
+        <p class="hint2" id="notInstalled" hidden>
+          Not installed yet. Saving here, or Redo shortcuts, installs and
+          writes them.
+        </p>
+        <div class="fld">
+          <span class="lbl">Start with Windows
+            <span class="sub2" id="pathStartup"></span></span>
+          <span class="ctl"><input type="checkbox" class="switch" id="scStartup"></span>
+        </div>
+        <div class="fld">
+          <span class="lbl">Start menu
+            <span class="sub2" id="pathStartMenu"></span></span>
+          <span class="ctl"><input type="checkbox" class="switch" id="scStartMenu"></span>
+        </div>
+        <div class="fld">
+          <span class="lbl">Desktop shortcut
+            <span class="sub2" id="pathDesktop"></span></span>
+          <span class="ctl"><input type="checkbox" class="switch" id="scDesktop"></span>
+        </div>
       </div>
-      <div class="msg" id="appearanceMsg"></div>
     </div>
   </section>
 
@@ -2988,6 +3047,61 @@ PAGE = r"""<!doctype html>
 
   <footer id="where"></footer>
 </main>
+
+<!-- Every tab's buttons, latched to the foot of the window. Hidden until
+     loadState knows this is the manage view: the five setup steps are a
+     sequence, and each step's button belongs to that step. -->
+<div class="savebar" id="savebar" hidden>
+  <div class="inner">
+    <div class="msg" id="manageMsg" data-bar="accounts"></div>
+    <div class="msg" id="layoutMsg" data-bar="layout" hidden></div>
+    <div class="msg" id="appearanceMsg" data-bar="appearance" hidden></div>
+
+    <div class="acts" data-bar="accounts">
+      <span class="menu-root">
+        <span class="btn-group">
+          <button class="solid" id="saveAccounts">Save</button>
+          <button class="solid" id="saveAccountsMenuBtn" aria-haspopup="menu"
+                  aria-expanded="false" aria-label="More save options">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m6 9 6 6 6-6"/>
+            </svg>
+          </button>
+        </span>
+        <div class="menu" id="saveAccountsMenu" role="menu" hidden>
+          <button role="menuitem" id="saveAccountsRestart">Reload and Restart</button>
+        </div>
+      </span>
+    </div>
+
+    <div class="acts" data-bar="layout">
+      <button id="undoLayout" disabled>Undo last move</button>
+      <button id="restartLayout">Restart Widget</button>
+    </div>
+
+    <div class="acts" data-bar="appearance">
+      <button id="reinstall">Redo shortcuts</button>
+      <button id="restoreAppearance">Restore to Default</button>
+      <span class="menu-root">
+        <span class="btn-group">
+          <button class="solid" id="saveAppearance">Save</button>
+          <button class="solid" id="saveMenuBtn" aria-haspopup="menu"
+                  aria-expanded="false" aria-label="More save options">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m6 9 6 6 6-6"/>
+            </svg>
+          </button>
+        </span>
+        <div class="menu" id="saveMenu" role="menu" hidden>
+          <button role="menuitem" id="saveRestart">Save and Restart</button>
+          <button role="menuitem" id="saveReloadRestart">Reload and Restart</button>
+        </div>
+      </span>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -3366,6 +3480,181 @@ function renderGroups(groups) {
   }
 }
 
+// ------------------------------------------------------- packing the boxes
+//
+// CSS cannot do this on its own: in a two-column grid every row is as
+// tall as its tallest box, so a short box next to a tall one is either
+// stretched or trails a strip of empty page. The fix, from
+// DesktopTasks' settings page: measure each box, round its height up to
+// a whole number of --row-unit rows, and hand the grid that span, with
+// `dense` backfilling the holes. Tallest first, which is what lets the
+// big boxes claim their rows while there is still a free column beside
+// them.
+//
+// Measuring needs the browser, so this is a class the script adds.
+// Without it the grid still works -- just with the row heights CSS would
+// have given it.
+//
+// Below the one-column breakpoint there is nothing to pack around, so
+// binning is switched off rather than computed and ignored.
+const TWO_COLUMN = window.matchMedia('(min-width: 901px)');
+
+function gridMetrics() {
+  const style = getComputedStyle(document.documentElement);
+  return {
+    gap: parseFloat(style.getPropertyValue('--gap')) || 16,
+    unit: parseFloat(style.getPropertyValue('--row-unit')) || 4,
+  };
+}
+
+function layoutGrid(grid) {
+  const boxes = Array.from(grid.querySelectorAll(':scope > .card'))
+    .filter(box => !box.hidden);
+  for (const box of grid.querySelectorAll(':scope > .card[hidden]')) {
+    box.style.removeProperty('--span');
+    box.style.removeProperty('order');
+  }
+  if (!boxes.length) return;
+
+  if (!TWO_COLUMN.matches) {
+    grid.classList.remove('binned');
+    for (const box of boxes) {
+      box.style.removeProperty('--span');
+      box.style.removeProperty('order');
+    }
+    return;
+  }
+
+  // Measured with the bins off, so each box is its own content's height
+  // rather than the height of the bin it was last given. The column
+  // widths are the same either way, so the measurement holds.
+  grid.classList.remove('binned');
+  const heights = boxes.map(box => box.getBoundingClientRect().height);
+
+  const { gap, unit } = gridMetrics();
+  boxes.forEach((box, i) => {
+    // The gap rides along with every row but the last, so one row of
+    // content is worth unit + gap pixels. Rounded up: a box short of its
+    // bin shows a few pixels of its own background, a box over it would
+    // have its last field clipped.
+    box.style.setProperty('--span',
+      Math.max(1, Math.ceil((heights[i] + gap) / (unit + gap))));
+  });
+
+  // order, not a DOM move: the markup stays in the order it reads in,
+  // which is the order the tab key follows. Two exceptions to sorting by
+  // height, both marked on the box itself:
+  //
+  //   data-first  stays at the head, so the box a tab is *about* is the
+  //               one you read first -- packing put "Accounts on the
+  //               widget" above "Linked banks" purely for being taller
+  //   data-last   sorts to the end whatever its height, for the
+  //               full-width boxes, which cannot sit beside anything
+  boxes
+    .map((box, i) => ({
+      box, i, h: heights[i],
+      first: box.hasAttribute('data-first'),
+      last: box.hasAttribute('data-last'),
+    }))
+    .sort((a, b) => (b.first - a.first) || (a.last - b.last) ||
+      // The pinned-to-the-end boxes keep the order they are written in.
+      // They are stacked rather than side by side, so height buys
+      // nothing there -- and Backups belongs under Advanced, not above
+      // it for being the taller of the two.
+      (a.last ? a.i - b.i : b.h - a.h))
+    .forEach((entry, rank) => { entry.box.style.order = rank; });
+
+  grid.classList.add('binned');
+  evenColumnBottoms(grid, boxes, gap, unit);
+}
+
+// Squares off the bottom of the grid. Dense packing has already moved
+// what it can, so a ragged edge left here is one no box can fill: the
+// columns ran out of boxes, not out of room. The bottom box in the short
+// column grows to the other column's bottom rather than leaving a strip
+// of page under it -- it is mostly its own padding either way, and a box
+// that ends where its neighbour ends reads as deliberate.
+//
+// Full-width boxes sit this out: one cannot be ragged against anything,
+// and both of ours are pinned to the end.
+function evenColumnBottoms(grid, boxes, gap, unit) {
+  const gridRect = grid.getBoundingClientRect();
+  const colWidth = (gridRect.width - gap) / 2;
+
+  // Reading these forces the layout the spans just asked for, so the
+  // positions are the packed ones rather than the previous pass's.
+  const placed = boxes.map(box => {
+    const rect = box.getBoundingClientRect();
+    return {
+      box,
+      bottom: rect.bottom - gridRect.top,
+      wide: rect.width > colWidth + gap / 2,
+      // Which column, by where the box starts. Half a column of slack,
+      // so sub-pixel column widths cannot flip the answer.
+      col: rect.left - gridRect.left > colWidth / 2 ? 1 : 0,
+    };
+  });
+
+  const narrow = placed.filter(p => !p.wide);
+  if (narrow.length < 2) return;
+  const target = Math.max(...narrow.map(p => p.bottom));
+
+  for (const col of [0, 1]) {
+    const inColumn = narrow.filter(p => p.col === col);
+    if (!inColumn.length) continue;
+    const last = inColumn.reduce((a, b) => (b.bottom > a.bottom ? b : a));
+    // Both bottoms sit on row boundaries, so the distance between them is
+    // a whole number of rows; rounding just absorbs sub-pixel error.
+    const rows = Math.round((target - last.bottom) / (unit + gap));
+    if (rows < 1) continue;
+    const span = Number(last.box.style.getPropertyValue('--span')) || 1;
+    last.box.style.setProperty('--span', span + rows);
+  }
+}
+
+// Anything that changes what a box holds changes how tall it is, so this
+// runs after every redraw rather than once on load. Coalesced to one
+// pass per frame: a single load calls it from half a dozen draws, and
+// each pass costs a forced reflow.
+let relayoutQueued = false;
+
+function relayout() {
+  if (relayoutQueued) return;
+  relayoutQueued = true;
+  requestAnimationFrame(() => {
+    relayoutQueued = false;
+    for (const grid of document.querySelectorAll('.grid')) {
+      if (grid.closest('section[hidden]')) continue;
+      layoutGrid(grid);
+    }
+    // The spans and the order just written are mutations of these same
+    // grids. Dropping the records keeps the watcher below from calling
+    // this straight back -- the repack is not news.
+    gridWatcher.takeRecords();
+  });
+}
+
+// A dozen places redraw a box: the bank list, the account table, the
+// profile rows, the backup log, a chevron opening a profile's fields.
+// Rather than remember to repack from each of them, watch the grids
+// themselves -- a box added, removed, hidden or re-rendered is a
+// mutation, and that is exactly the set of events that changes a
+// height.
+const gridWatcher = new MutationObserver(relayout);
+for (const grid of document.querySelectorAll('.grid')) {
+  gridWatcher.observe(grid, {
+    childList: true, subtree: true,
+    attributes: true, attributeFilter: ['hidden', 'class'],
+  });
+}
+
+// Column widths change with the window, and so does every wrapped line
+// inside them.
+window.addEventListener('resize', relayout);
+// Text measured before the real font arrives is measured at the
+// fallback's metrics, which is a box or two out by a line.
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(relayout);
+
 function showTab(name) {
   for (const btn of document.querySelectorAll('.tab')) {
     const on = btn.dataset.tab === name;
@@ -3375,6 +3664,15 @@ function showTab(name) {
   $('tab-accounts').hidden = name !== 'accounts';
   $('tab-layout').hidden = name !== 'layout';
   $('tab-appearance').hidden = name !== 'appearance';
+  // The ribbon is per tab: only this tab's buttons and only its message.
+  for (const el of document.querySelectorAll('.savebar [data-bar]')) {
+    const on = el.dataset.bar === name;
+    el.classList.toggle('on', on);
+    if (el.classList.contains('msg')) el.hidden = !on;
+  }
+  // A hidden grid measures zero, so a tab is packed when it is shown and
+  // not before.
+  relayout();
   // Loaded on first open rather than up front: each is a file read, and
   // most visits to this page only want the Accounts tab. Reset to null by
   // anything that changes the file, so reopening re-reads.
@@ -3404,10 +3702,10 @@ async function loadState() {
     $('subtitle').textContent = 'Already set up. Change what you need.';
     document.querySelector('main').classList.add('manage');
     $('tabs').hidden = false;
+    $('savebar').hidden = false;
     for (const s of ['s1','s2','s3','s4','s5']) step(s, 'hidden');
     showTab(document.querySelector('.tab.on').dataset.tab);
-    $('autostartManage').checked = STATE.autostart;
-    $('notInstalled').hidden = STATE.installed;
+    fillShortcuts();
     renderProfiles();
     renderLinkTarget();
     renderBackups();
@@ -3415,10 +3713,14 @@ async function loadState() {
     renderTrialUse();
     $('sandboxCreds').hidden = STATE.environment !== 'sandbox';
     renderGroups(STATE.groups);
+    // Every box above has just been filled, so their heights are only
+    // now what they will be.
+    relayout();
   } else {
     $('subtitle').textContent = 'Five steps, about two minutes.';
     document.querySelector('main').classList.remove('manage');
     $('tabs').hidden = true;
+    $('savebar').hidden = true;
     $('tab-accounts').hidden = true;
     $('tab-layout').hidden = true;
     $('tab-appearance').hidden = true;
@@ -3431,7 +3733,7 @@ async function loadState() {
   // "Restarting…" and then have loaded() put the stale old label back.
   // The menu option launches rather than restarts when nothing is running,
   // and /api/launch already does both -- so only the wording moves.
-  relabel($('reloadRestart'),
+  relabel($('saveAccountsRestart'),
           STATE.running ? 'Reload and Restart' : 'Reload and Launch');
   relabel($('launch'), STATE.running ? 'Restart DesktopCards' : 'Launch DesktopCards');
 }
@@ -3588,25 +3890,16 @@ $('quit').onclick = async () => {
 $('addBank').onclick = () => runLink($('manageMsg'), async () => {
   await loadState();
 });
-$('reinstall').onclick = async () => {
-  const btn = $('reinstall');
-  loading(btn, 'Writing shortcuts…');
-  say($('manageMsg'), 'Writing shortcuts…');
-  try {
-    await api('/api/install', { autostart: $('autostartManage').checked });
-    say($('manageMsg'), 'Shortcuts updated.', 'ok');
-  } catch (e) { say($('manageMsg'), e.message, 'bad'); }
-  loaded(btn);
-};
-// Same work, from the checkbox rather than the button -- so it spins the
-// button too, which is where the result shows up.
-$('autostartManage').onchange = () => $('reinstall').onclick();
 // Pull fresh balances, and on the menu option restart the widget after.
+// The button says Save because that is what is left for a button to do
+// here: every tick on this tab writes as you change it, so bringing the
+// numbers up to date is the only pending work.
+//
 // Same order as the Appearance tab's version and for the same reason: the
 // widget reads data.json as it comes up, so fetching first means it draws
 // the new balances immediately rather than the previous ones.
 async function reloadWidget(restart) {
-  const btn = $('reloadWidget'), chevron = $('reloadMenuBtn');
+  const btn = $('saveAccounts'), chevron = $('saveAccountsMenuBtn');
   loading(btn, 'Reloading…');
   chevron.disabled = true;
   say($('manageMsg'), 'Fetching balances…');
@@ -3649,16 +3942,23 @@ async function reloadWidget(restart) {
   setTimeout(() => { loaded(btn); chevron.disabled = false; loadState(); }, 4000);
 }
 
-$('reloadWidget').onclick = () => reloadWidget(false);
-$('reloadRestart').onclick = () => reloadWidget(true);
-wireMenu('reloadMenuBtn', 'reloadMenu');
+$('saveAccounts').onclick = () => reloadWidget(false);
+$('saveAccountsRestart').onclick = () => reloadWidget(true);
+wireMenu('saveAccountsMenuBtn', 'saveAccountsMenu');
 
 // ------------------------------------------------------------- profiles
 // A profile is one Plaid client ID in one environment. Several can be
 // enabled at once, which is what puts work and personal accounts on one
 // widget; enabling a sandbox profile switches the whole widget to test
 // data, on its own.
-$('advToggle').onchange = () => { $('advanced').hidden = !$('advToggle').checked; };
+$('advToggle').onchange = () => {
+  const on = $('advToggle').checked;
+  $('advanced').hidden = !on;
+  // Backups is the same switch: it is the other half of what Advanced
+  // holds, it is just its own box now.
+  $('backupsCard').hidden = !on;
+  relayout();
+};
 
 function applyProfiles(r) {
   if (r && r.backups) STATE.backups = r.backups;
@@ -4181,38 +4481,32 @@ function rowReasons(section) {
 }
 
 function renderLayout() {
-  const rules = $('layoutRules'), lists = $('layoutSections');
-  rules.innerHTML = '';
-  lists.innerHTML = '';
-  // Both columns are written section by section, so each one's two halves
-  // stay in the same order down the page and the headings line up across.
-  const sectionBlock = (host, section) => {
-    const col = document.createElement('div');
-    col.className = 'colblock';
+  const host = $('layoutSections');
+  host.innerHTML = '';
+  // A box per widget section: its heading, its row rules, then its cards.
+  const sectionCard = section => {
+    const box = document.createElement('div');
+    box.className = 'card';
     const h = document.createElement('h3');
     h.className = 'grp';
     h.textContent = SECTION_LABELS[section];
-    col.append(h);
-    host.append(col);
-    return col;
+    box.append(h);
+    host.append(box);
+    return box;
   };
 
   for (const section of ['depository', 'credit']) {
     const cards = LAYOUT_ROWS[section] || [];
 
-    // Heading text and the row rules still belong to the section they
-    // affect -- they're just all in the left column now, so the lists on
-    // the right are one uninterrupted run of drag targets.
-    const rule = sectionBlock(rules, section);
-    rule.append(layoutField(section, 'title', 'Heading shown on the widget', 'text'));
+    const list = sectionCard(section);
+    list.append(layoutField(section, 'title', 'Heading shown on the widget', 'text'));
     if (section === 'depository') {
-      rule.append(layoutField(section, 'new_row_digit_threshold',
+      list.append(layoutField(section, 'new_row_digit_threshold',
         'Own row at this many balance digits', 'int', 'Default 6, i.e. $100,000+'));
-      rule.append(layoutField(section, 'new_row_name_length_threshold',
+      list.append(layoutField(section, 'new_row_name_length_threshold',
         'Own row past this many name characters', 'int', 'Default 12'));
     }
 
-    const list = sectionBlock(lists, section);
     if (!cards.length) {
       const p = document.createElement('p');
       p.className = 'hint2';
@@ -4229,6 +4523,7 @@ function renderLayout() {
     list.append(ul);
   }
   $('undoLayout').disabled = UNDO.length === 0;
+  relayout();
 }
 
 function layoutField(section, field, label, type, sub) {
@@ -4639,17 +4934,21 @@ function inputFor(f) {
 
 function buildAppearanceForm() {
   const host = $('appearanceForm');
-  host.innerHTML = '';
-  // The host is a two-column flow, and a group that split across the
-  // break would leave its heading at the foot of one column and half its
-  // fields at the head of the next. So each heading opens a .colblock that
-  // its fields go into, and break-inside: avoid keeps that block whole.
+  // Everything except the hand-written Shortcuts box, which is markup
+  // rather than a generated field and holds ticks that are pending.
+  for (const el of [...host.children]) {
+    if (el.id !== 'shortcutsCard') el.remove();
+  }
+  // Each heading in APPEARANCE_FIELDS opens a box, and its fields go in
+  // there. The list's first entry is a heading, so no field can land
+  // outside one -- the fallback below is for a hand-added field that
+  // forgets that, which belongs on the page rather than nowhere.
   let block = null;
   const into = el => (block || host).append(el);
   for (const f of APPEARANCE_FIELDS) {
     if (f.grp) {
       block = document.createElement('div');
-      block.className = 'colblock';
+      block.className = 'card';
       const h = document.createElement('h3');
       h.className = 'grp';
       h.textContent = f.grp;
@@ -4683,7 +4982,7 @@ function buildAppearanceForm() {
     row.append(lbl, ctl);
     into(row);
   }
-
+  relayout();
 }
 
 function fillAppearanceForm(source) {
@@ -4793,6 +5092,18 @@ async function saveAppearance(restart, reload) {
     STATE.dark_theme = r.appearance.dark_theme;
     STATE.accent = r.appearance.accent;
     saved = true;
+    if (shortcutsChanged()) {
+      say($('appearanceMsg'), 'Saved. Writing shortcuts…');
+      try {
+        await api('/api/install', shortcutsWanted());
+        Object.assign(STATE, shortcutsWanted());
+      } catch (e) {
+        say($('appearanceMsg'), 'Settings saved, but the shortcuts failed: ' +
+            e.message, 'bad');
+        loaded(btn); chevron.disabled = false;
+        return;
+      }
+    }
     say($('appearanceMsg'), STATE.running
       ? 'Saved. The widget picks most of this up on its next refresh; use ' +
         'Save and Restart for anything marked restart.'
@@ -4853,12 +5164,58 @@ $('saveRestart').onclick = () => saveAppearance(true, false);
 $('saveReloadRestart').onclick = () => saveAppearance(true, true);
 wireMenu('saveMenuBtn', 'saveMenu');
 
+// ---------------------------------------------------------- shortcuts
+// Not in appearance.json, so not part of collectAppearance: these three
+// are files on disk. They follow the tab's rule anyway -- a tick is
+// pending until Save, so a stray click is undone by not saving.
+function fillShortcuts() {
+  $('scStartup').checked = STATE.autostart;
+  $('scStartMenu').checked = STATE.start_menu;
+  $('scDesktop').checked = STATE.desktop;
+  const dirs = STATE.shortcut_dirs || {};
+  $('pathStartup').textContent = dirs.startup || '';
+  $('pathStartMenu').textContent = dirs.start_menu || '';
+  $('pathDesktop').textContent = dirs.desktop || '';
+  $('notInstalled').hidden = STATE.installed;
+}
+
+function shortcutsWanted() {
+  return {
+    autostart: $('scStartup').checked,
+    start_menu: $('scStartMenu').checked,
+    desktop: $('scDesktop').checked,
+  };
+}
+
+// Only when a tick actually moved. An install copies the exe and rewrites
+// every shortcut, which is not work a Save that changed a color should be
+// doing.
+function shortcutsChanged() {
+  const want = shortcutsWanted();
+  return want.autostart !== STATE.autostart ||
+         want.start_menu !== STATE.start_menu ||
+         want.desktop !== STATE.desktop;
+}
+
+$('reinstall').onclick = async () => {
+  const btn = $('reinstall');
+  loading(btn, 'Writing shortcuts…');
+  say($('appearanceMsg'), 'Writing shortcuts…');
+  try {
+    await api('/api/install', shortcutsWanted());
+    say($('appearanceMsg'), 'Shortcuts updated.', 'ok');
+    await loadState();
+  } catch (e) { say($('appearanceMsg'), e.message, 'bad'); }
+  loaded(btn);
+};
+
 // Loaded into the form rather than written straight to disk: one wrong
 // click shouldn't be able to erase a tuned position and palette with no
 // way back, and Save is right there.
 $('restoreAppearance').onclick = () => {
   if (!APPEARANCE_DEFAULTS) return;
   fillAppearanceForm(APPEARANCE_DEFAULTS);
+  fillShortcuts();
   say($('appearanceMsg'), 'Defaults loaded into the form. Press Save to apply them.', 'ok');
 };
 
